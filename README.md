@@ -1,5 +1,7 @@
 # DeepSeek Harness QVD 安全修复补丁与验证脚本（0.1.2-alpha.2）
 
+[English](README.en.md) | 简体中文
+
 本仓库提供针对 DeepSeek Harness 公开披露漏洞的**社区补丁**与验证脚本，基于上游 **0.1.2-alpha.2** 基线。其中 **4 个漏洞（52631 / 52632 / 52644 / 52646）有源码修改**；**57410 是对该基线内已有修复的版本核验，本仓库未修改它**。
 
 > 本仓库**不是官方安全更新，也不是完整安全审计**；不保证不存在其它未发现、未覆盖或与版本相关的安全问题。
@@ -23,28 +25,38 @@
 
 ## 五个漏洞
 
-### QVD-2026-52631 — loader 配置表达式注入
+| QVD | CVSS | 本仓库处理 |
+|---|---|---|
+| QVD-2026-52646 | 10.0（严重） | 源码修复 |
+| QVD-2026-57410 | 9.8（极危） | 版本核验（基线已内置） |
+| QVD-2026-52644 | 高危（官方未给出具体数值） | 源码修复 |
+| QVD-2026-52631 | 7.8（高危） | 源码修复 |
+| QVD-2026-52632 | 7.5（高危） | 源码修复（含进程级读面残留） |
+
+> 分值来源：奇安信 CERT 披露及 CN-SEC 转述。52644 官方仅标注"高危"、未给出具体数值，此处不臆造数字。
+
+### QVD-2026-52631 — loader 配置表达式注入（CVSS 7.8）
 - **成因**：loader 对 `cordis.yml` 里的 `!!js` 表达式用 `with (ctx) { eval(expr) }` 包在 `new Function` 中求值；表达式经 `ctx` 落到宿主全局作用域，可拿到 `process` / `require` / `module`。
 - **影响**：加载配置文件阶段即可在宿主进程执行任意代码（读文件、执行命令、访问凭证）。
 - **修复**：改为 `node:vm` 隔离求值；上下文以单个 JSON 字符串注入并在 vm 内重建（宿主对象零注入）；`process` 只暴露 `env/platform/arch/version/execPath/cwd` 与 `getBuiltinModule('node:url')`；`runInContext(..., { timeout: 1000 })` 限时。
 
-### QVD-2026-52632 — fs-sandbox 读逃逸
+### QVD-2026-52632 — fs-sandbox 读逃逸（CVSS 7.5）
 - **成因**：`fs-sandbox` 只约束了写入，读取可越过工作区读取任意路径。
 - **影响**：受限会话读到本不该访问的文件（凭据、配置、其它项目文件）。
 - **修复**：读方法（`readText` / `streamText` / `readBytes`）在执行点按策略校验目标；越界抛结构化 `FS_SANDBOX_DENIED`；`tool-fs` 读前解析会话策略并传入，denial 经 `mapError` 映射。
 - **已知残留**：本补丁只收窄了**进程内**读取；**进程级**沙箱（bwrap `--ro-bind / /`、landlock `readOnly: ['/']`、seatbelt allow-default）仍把整个宿主只读暴露给受限 shell 子进程。即只读会话里的 bash/pwsh 仍可能读取 `~/.ssh`、`.env` 等。详见 `FIXES.md`「已知残留与限制」。
 
-### QVD-2026-52644 — cordis 沙箱工具逃逸
+### QVD-2026-52644 — cordis 沙箱工具逃逸（CVSS 高危）
 - **成因**：沙箱内自定义工具的 `execute` 拿到的执行上下文携带真实的 `agent` / `ctx` / `session` 等对象。
 - **影响**：模型可通过这些对象调用宿主能力，逃出沙箱。
 - **修复**：新增 `sandboxToolExec` 白名单执行视图，仅含 `name` / `callId` / `arguments`（JSON clone）/ `signal`。
 
-### QVD-2026-52646 — bash/pwsh 子进程逃逸
+### QVD-2026-52646 — bash/pwsh 子进程逃逸（CVSS 10.0）
 - **成因**：受限策略下 bash/pwsh 仍可直接 spawn 子进程，绕过沙箱。
 - **影响**：在受限会话内执行任意系统命令。
 - **修复**：`SubprocessSpawnSpec` 增加 `sandboxPolicy` 与 `argvConfined`；受限策略未声明 `argvConfined` 即拒绝启动；`bash-local` / `pwsh-local` 在受限时 stamp `argvConfined: true`。
 
-### QVD-2026-57410 — 未授权访问 / 伪造 Host（版本核验，非本仓库修复）
+### QVD-2026-57410 — 未授权访问 / 伪造 Host（CVSS 9.8，版本核验，非本仓库修复）
 - **成因**：历史版本缺少浏览器会话鉴权，伪造 Host 或未带凭据即可访问。
 - **影响**：未授权调用 web 接口。
 - **处理**：审计确认 0.1.2-alpha.2 已内置 browser-token 会话鉴权（launch token + 签名 cookie + 401/403 门禁）。本仓库**未改动**该文件，仅记录该基线中的现有鉴权实现。
