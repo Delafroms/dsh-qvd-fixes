@@ -2,9 +2,24 @@
 
 [English](README.en.md) | 简体中文
 
+| 项目 | 值 |
+|---|---|
+| Target（目标版本） | DeepSeek Harness 0.1.2-alpha.2 |
+| Status（性质） | Community patch（社区补丁，非官方） |
+| Scope（源码修复范围） | QVD-2026-52631 / 52632 / 52644 / 52646 |
+| Upstream-fixed（上游已修） | QVD-2026-57410 |
+
 本仓库提供针对 DeepSeek Harness 公开披露漏洞的**社区补丁**与验证脚本，基于上游 **0.1.2-alpha.2** 基线。其中 **4 个漏洞（52631 / 52632 / 52644 / 52646）有源码修改**；**57410 是对该基线内已有修复的版本核验，本仓库未修改它**。
 
 > 本仓库**不是官方安全更新，也不是完整安全审计**；不保证不存在其它未发现、未覆盖或与版本相关的安全问题。
+
+## Quick Start
+
+1. 确认你的 DSH 检出基于 **0.1.2-alpha.2**；
+2. 下载 `fixes.patch` 与 `verify-dsh-fixes.bat`；
+3. 运行 `verify-dsh-fixes.bat` 查看当前修复状态；
+4. `git apply --check fixes.patch` 补丁预检；
+5. 确认无误后 `git apply fixes.patch` 应用。
 
 ## 目录内容
 
@@ -129,7 +144,7 @@ certutil -hashfile "LICENSE" SHA256
 | `LICENSE` | `B546772903BAEBAFB411FD4A5E1A5B91855659BF38C56165A7096712615C8AF9` |
 
 说明：
-- 表中不含 README 自身（它无法自证，请以其它文件为准）。
+- README（`README.md` / `README.en.md`）不纳入哈希表：哈希值就写在 README 文件自身内部，无法用 README 自身内容证明它未被修改；请以 `verify-dsh-fixes.bat`、`fixes.patch`、`FIXES.md`、`LICENSE` 这些独立文件为准。
 - 脚本不做自我校验：把哈希写进自身会形成自指、且攻击者可连校验代码一起改，故采用"外部公布值 + certutil 手工核对"。
 - 作者每次修改文件后需同步更新上表。
 

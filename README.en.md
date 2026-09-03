@@ -2,9 +2,24 @@
 
 [简体中文](README.md) | English
 
+| Item | Value |
+|---|---|
+| Target | DeepSeek Harness 0.1.2-alpha.2 |
+| Status | Community patch (unofficial) |
+| Scope (source fixes) | QVD-2026-52631 / 52632 / 52644 / 52646 |
+| Upstream-fixed | QVD-2026-57410 |
+
 This repository provides a **community patch** and verification script for publicly disclosed vulnerabilities in DeepSeek Harness, based on the upstream **0.1.2-alpha.2** baseline. **Four vulnerabilities (52631 / 52632 / 52644 / 52646) have source-code fixes**; **57410 is a version verification of the already-existing fix in this baseline — this repository does not modify it**.
 
 > This repository is **not an official security update, and not a full security audit**; it does not guarantee the absence of other undiscovered, uncovered, or version-related issues.
+
+## Quick Start
+
+1. Confirm your DSH checkout is based on **0.1.2-alpha.2**;
+2. Download `fixes.patch` and `verify-dsh-fixes.bat`;
+3. Run `verify-dsh-fixes.bat` to inspect the current fix status;
+4. `git apply --check fixes.patch` to dry-run the patch;
+5. After review, `git apply fixes.patch` to apply.
 
 ## Contents
 
@@ -123,7 +138,7 @@ certutil -hashfile "LICENSE" SHA256
 | `LICENSE` | `B546772903BAEBAFB411FD4A5E1A5B91855659BF38C56165A7096712615C8AF9` |
 
 Notes:
-- The table omits the READMEs themselves (they cannot self-verify; rely on the other files).
+- The READMEs (`README.md` / `README.en.md`) are excluded from the table because their hash would be written inside the files themselves, which cannot prove the files unmodified; rely on the independent files `verify-dsh-fixes.bat`, `fixes.patch`, `FIXES.md`, `LICENSE` instead.
 - The script does not self-verify: embedding its own hash is self-referential, and an attacker could patch the check too; so we publish the values and use `certutil` to compare manually.
 - Update this table whenever a file changes.
 
