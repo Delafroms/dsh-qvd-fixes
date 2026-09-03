@@ -38,28 +38,28 @@ This repository provides a **community patch** and verification script for publi
 
 ### QVD-2026-52631 — loader config expression injection (CVSS 7.8)
 - **Cause**: the loader evaluated `!!js` expressions in `cordis.yml` via `with (ctx) { eval(expr) }` wrapped in `new Function`; the expression fell through `ctx` to the host global scope, reaching `process` / `require` / `module`.
-- **Impact**: arbitrary code execution in the host process at config load time.
+- **Consequences**: once an attacker can plant a malicious `!!js` in `cordis.yml` / `cordis.patch.yml` (e.g. by tricking a user into cloning a malicious repo or applying a tampered profile), it runs **synchronously as arbitrary Node code with host-process privileges** at load time — reading files, running commands, stealing API keys from environment variables — and, via HMR watching, can persist as a "write-once, replayed-every-start" backdoor. Prerequisite: the attacker must first be able to deliver or write the malicious config; this is not a one-click remote trigger.
 - **Fix**: `node:vm` isolated evaluation; context crosses as one JSON string and is rebuilt inside the vm (zero host-object injection); `process` exposes only `env/platform/arch/version/execPath/cwd` and `getBuiltinModule('node:url')`; `runInContext(..., { timeout: 1000 })` bounds runtime.
 
 ### QVD-2026-52632 — fs-sandbox read escape (CVSS 7.5)
 - **Cause**: `fs-sandbox` constrained only writes; reads could escape the workspace.
-- **Impact**: a confined session could read files it should not (credentials, config, other projects).
+- **Consequences**: information disclosure. In-process: the model can read arbitrary paths outside the workspace; process-level: a confined shell subprocess can read the entire host filesystem. An attacker can steal `~/.ssh` private keys, `.env`, cloud credentials, API keys, and other project sources. It does not directly write files or run commands, but the stolen credentials enable lateral movement or further intrusion.
 - **Fix**: `readText` / `streamText` / `readBytes` now validate the target against policy at the execution point and throw structured `FS_SANDBOX_DENIED`; `tool-fs` resolves the session policy and passes it in, mapping denials via `mapError`.
 - **Known gap**: this patch only narrows the **in-process** read path. The **process-level** sandbox backends (bwrap `--ro-bind / /`, landlock `readOnly: ['/']`, seatbelt allow-default) still expose the entire host filesystem read-only to confined shell subprocesses. See `FIXES.md` "已知残留与限制".
 
 ### QVD-2026-52644 — cordis sandbox tool escape (CVSS High)
 - **Cause**: the `execute` of a sandbox-defined tool received the real execution context carrying `agent` / `ctx` / `session` objects.
-- **Impact**: model code could reach host services, including secret storage.
+- **Consequences**: a key step of sandbox escape. Model code reaches the real runtime `Context` via `exec.agent.ctx`, escalating from "restricted vm code execution" to "access to host services (including secret storage)". It is typically one link in an attack chain, combined with 52646 to reach host RCE.
 - **Fix**: a whitelisted `sandboxToolExec` execution view exposing only `name` / `callId` / `arguments` (JSON clone) / `signal`.
 
 ### QVD-2026-52646 — bash/pwsh subprocess escape (CVSS 10.0)
 - **Cause**: under a confined policy bash/pwsh could still spawn directly, bypassing the sandbox.
-- **Impact**: arbitrary command execution inside a confined session.
+- **Consequences**: the most severe — a chained path to **arbitrary command execution on the host**. Full chain: indirect prompt injection → induce the model to call `cordis_define` + `cordis_run` → vm escape to the host exec → unconstrained `subprocess.spawn` → run arbitrary commands with the DSH process's privileges (public demos reached root). Under the default composition it does not depend on any deployment misconfiguration.
 - **Fix**: `SubprocessSpawnSpec` gains `sandboxPolicy` and `argvConfined`; `subprocess-local` enforces `assertConfinedUnderPolicy` at the spawn execution point (a confined policy without `argvConfined` is refused); `bash-local` / `pwsh-local` stamp `argvConfined: true` when confined.
 
 ### QVD-2026-57410 — unauthorized access / forged Host (CVSS 9.8, version verification, not fixed here)
 - **Cause**: historical versions lacked browser-session auth; a forged Host header or missing credential could access the API.
-- **Impact**: unauthorized web API calls.
+- **Consequences**: **unauthenticated remote code execution**. An attacker forges the Host header to unlock privileged RPC, registers a temporary LLM provider pointing at their own fake model server, and drives the bash tool with deterministic tool calls — **no real model and no valid API key required** — to run commands on an instance exposed to the network (public PoCs obtain a root shell). Prerequisite: the service must be reachable on a non-loopback network; a `127.0.0.1`-only listener is not directly threatened by this path.
 - **Handling**: audit confirms 0.1.2-alpha.2 already ships browser-token session auth (launch token + signed cookie + 401/403 gate). This repository does **not** modify that file; it only records the existing auth implementation in this baseline.
 
 ## What running verify-dsh-fixes.bat does

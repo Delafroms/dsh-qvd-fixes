@@ -37,28 +37,28 @@
 
 ### QVD-2026-52631 — loader 配置表达式注入（CVSS 7.8）
 - **成因**：loader 对 `cordis.yml` 里的 `!!js` 表达式用 `with (ctx) { eval(expr) }` 包在 `new Function` 中求值；表达式经 `ctx` 落到宿主全局作用域，可拿到 `process` / `require` / `module`。
-- **影响**：加载配置文件阶段即可在宿主进程执行任意代码（读文件、执行命令、访问凭证）。
+- **后果**：攻击者一旦把恶意 `!!js` 写进 `cordis.yml` / `cordis.patch.yml`（例如诱导克隆恶意仓库、应用被篡改的 profile），配置加载时即以宿主进程权限**同步执行任意 Node 代码**——读取文件、执行命令、窃取环境变量中的 API 密钥，并可借 HMR 监听形成"写入即执行、每次启动重放"的持久后门。前提：攻击者需先能投递或写入恶意配置，非远程一键触发。
 - **修复**：改为 `node:vm` 隔离求值；上下文以单个 JSON 字符串注入并在 vm 内重建（宿主对象零注入）；`process` 只暴露 `env/platform/arch/version/execPath/cwd` 与 `getBuiltinModule('node:url')`；`runInContext(..., { timeout: 1000 })` 限时。
 
 ### QVD-2026-52632 — fs-sandbox 读逃逸（CVSS 7.5）
 - **成因**：`fs-sandbox` 只约束了写入，读取可越过工作区读取任意路径。
-- **影响**：受限会话读到本不该访问的文件（凭据、配置、其它项目文件）。
+- **后果**：信息泄露。进程内面：模型可读取工作区之外的任意路径；进程级面：受限 shell 子进程可读整个宿主文件系统。攻击者可窃取 `~/.ssh` 私钥、`.env`、云凭据、API 密钥及其它项目源码。它不直接写文件或执行命令，但泄露的凭据可被用于横向移动或进一步入侵。
 - **修复**：读方法（`readText` / `streamText` / `readBytes`）在执行点按策略校验目标；越界抛结构化 `FS_SANDBOX_DENIED`；`tool-fs` 读前解析会话策略并传入，denial 经 `mapError` 映射。
 - **已知残留**：本补丁只收窄了**进程内**读取；**进程级**沙箱（bwrap `--ro-bind / /`、landlock `readOnly: ['/']`、seatbelt allow-default）仍把整个宿主只读暴露给受限 shell 子进程。即只读会话里的 bash/pwsh 仍可能读取 `~/.ssh`、`.env` 等。详见 `FIXES.md`「已知残留与限制」。
 
 ### QVD-2026-52644 — cordis 沙箱工具逃逸（CVSS 高危）
 - **成因**：沙箱内自定义工具的 `execute` 拿到的执行上下文携带真实的 `agent` / `ctx` / `session` 等对象。
-- **影响**：模型可通过这些对象调用宿主能力，逃出沙箱。
+- **后果**：沙箱逃逸的关键一环。模型代码经 `exec.agent.ctx` 拿到真实运行时 Context，从"受限 vm 代码执行"升级为"访问宿主服务（含秘密存储）"。它通常作为攻击链的一步，与 52646 串联后达成宿主机 RCE。
 - **修复**：新增 `sandboxToolExec` 白名单执行视图，仅含 `name` / `callId` / `arguments`（JSON clone）/ `signal`。
 
 ### QVD-2026-52646 — bash/pwsh 子进程逃逸（CVSS 10.0）
 - **成因**：受限策略下 bash/pwsh 仍可直接 spawn 子进程，绕过沙箱。
-- **影响**：在受限会话内执行任意系统命令。
+- **后果**：最严重的一条，链式达成**宿主机任意命令执行**。完整链路：间接提示注入 → 诱导模型调用 `cordis_define` + `cordis_run` → vm 逃逸取得宿主 exec → 无约束 `subprocess.spawn` → 以 DSH 进程的权限执行任意命令（公开演示可达 root）。默认组合下不依赖任何部署配置失误。
 - **修复**：`SubprocessSpawnSpec` 增加 `sandboxPolicy` 与 `argvConfined`；受限策略未声明 `argvConfined` 即拒绝启动；`bash-local` / `pwsh-local` 在受限时 stamp `argvConfined: true`。
 
 ### QVD-2026-57410 — 未授权访问 / 伪造 Host（CVSS 9.8，版本核验，非本仓库修复）
 - **成因**：历史版本缺少浏览器会话鉴权，伪造 Host 或未带凭据即可访问。
-- **影响**：未授权调用 web 接口。
+- **后果**：**远程未认证 RCE**。攻击者伪造 Host 头解锁高权限 RPC，注册一个指向自身假模型服务器的临时 LLM 提供者，用确定性工具调用驱动 bash 工具——**无需真实模型、无需有效 API 密钥**，即可对暴露到公网的实例执行命令（公开 PoC 可拿下 root shell）。前提：服务暴露到非 loopback 网络；仅 `127.0.0.1` 本地监听不受此路径直接威胁。
 - **处理**：审计确认 0.1.2-alpha.2 已内置 browser-token 会话鉴权（launch token + 签名 cookie + 401/403 门禁）。本仓库**未改动**该文件，仅记录该基线中的现有鉴权实现。
 
 ## 运行 verify-dsh-fixes.bat 会发生什么
