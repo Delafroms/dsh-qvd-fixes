@@ -1,0 +1,978 @@
+diff --git a/packages/extensions/cordis-host-runner/src/guard.ts b/packages/extensions/cordis-host-runner/src/guard.ts
+index a70e47ef55..bc5f1e2863 100644
+--- a/packages/extensions/cordis-host-runner/src/guard.ts
++++ b/packages/extensions/cordis-host-runner/src/guard.ts
+@@ -539,12 +539,44 @@ function assertRenderedContent(value: JsonValue): ContentBlock[] {
+   )
+ }
+ 
++/**
++ * Whitelisted execution facts a sandbox tool's `execute` receives in place of
++ * the real tool-execution context. The live `ToolExecution` handed to host
++ * tools carries `agent` (and through it the real runtime `ctx` and `session`)
++ * — a model-written function must never see those, or the vm façade's denial
++ * surface is bypassed by object graph instead of syntax. Only inert identity
++ * and JSON argument fields cross the boundary; `signal` is forwarded because
++ * cancellation is a cooperative contract the sandbox module already extends
++ * to host closures, and every other member is dropped.
++ * @param exec - the host tool-execution context (may be `undefined` for direct calls).
++ * @returns a plain view carrying at most `name`, `callId`, `arguments`, and `signal`.
++ */
++export function sandboxToolExec(exec: unknown): Record<string, unknown> | undefined {
++  if (!isPlainRecord(exec)) return undefined
++  const view: Record<string, unknown> = {}
++  for (const key of ['name', 'callId'] as const) {
++    if (typeof exec[key] === 'string') view[key] = exec[key]
++  }
++  if (exec.arguments !== undefined) {
++    try {
++      view.arguments = cloneJson(exec.arguments, 'tool execution arguments')
++    } catch {
++      // Arguments already crossed JSON validation before dispatch; a clone
++      // failure means the caller bypassed it — drop the field rather than
++      // leak the live object.
++    }
++  }
++  if (exec.signal instanceof AbortSignal) view.signal = exec.signal
++  return view
++}
++
+ /**
+  * The `harness.defineTool` handed into the sandbox: the real DSL, with `parameters` normalized
+  * into a fresh host-realm ParameterSchemaSpec (raw object wrappers unwrapped,
+  * required arrays mapped, and explicit DSL object openness enforced) and the tool's `execute` return normalized into the host realm
+  * via a JSON round-trip. Non-JSON or wrong-shape output fails that call instead of poisoning
+- * the session log.
++ * the session log. The model-written `execute` receives {@link sandboxToolExec}
++ * instead of the live tool-execution context, so `agent`/`ctx` never enter the vm realm.
+  * @param options - the standard `defineTool` options; `parameters` may be the ParameterSchemaSpec DSL or a JSON-Schema-style wrapper.
+  * @returns the marker-tagged definition `harness.registerTool` (and the guarded `ctx.tools.register`) accepts.
+  */
+@@ -580,7 +612,10 @@ export function sandboxDefineTool(options: unknown): ToolDefinition {
+       } : {},
+     },
+     async execute(args: unknown, exec: unknown): Promise<JsonValue> {
+-      return cloneJson(await rawExecute(args, exec), 'harness.defineTool execute result') as JsonValue
++      // Never forward the live exec: it carries `agent` whose `ctx` is the
++      // real runtime context. The whitelisted view keeps cancellation and the
++      // JSON arguments without exposing any host handle to vm-realm code.
++      return cloneJson(await rawExecute(args, sandboxToolExec(exec)), 'harness.defineTool execute result') as JsonValue
+     },
+   })
+   const parameters = { ...tool.parameters, ...normalized.rootAnnotations }
+diff --git a/packages/extensions/cordis-host-runner/tests/sandbox-context.spec.ts b/packages/extensions/cordis-host-runner/tests/sandbox-context.spec.ts
+index 92fc2ebf87..2076893c43 100644
+--- a/packages/extensions/cordis-host-runner/tests/sandbox-context.spec.ts
++++ b/packages/extensions/cordis-host-runner/tests/sandbox-context.spec.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from 'vitest'
+ import { call, CONTENT_OUTPUT_CODE, dummyTool, mount, setup, text } from './helpers.ts'
++import { sandboxDefineTool, sandboxToolExec } from '../src/guard.ts'
+ 
+ /**
+  * The sandbox context façade is a whitelist, not a pass-through proxy. A running
+@@ -140,6 +141,67 @@ describe('sandbox context façade — escape surface is closed', () => {
+   })
+ })
+ 
++describe('sandbox tool execution boundary — exec view (QVD-2026-52644)', () => {
++  it('the whitelisted view drops the live agent while keeping identity and arguments', () => {
++    const view = sandboxToolExec({
++      callId: 'call-1',
++      name: 'host_tool',
++      arguments: { file_path: 'a.txt' },
++      agent: { id: 'agent-1', ctx: { root: {} } },
++      signal: new AbortController().signal,
++    })
++    expect(view).not.toBeUndefined()
++    expect(Object.keys(view!).sort()).toEqual(['arguments', 'callId', 'name', 'signal'])
++    expect((view as Record<string, unknown>).agent).toBeUndefined()
++  })
++
++  it('a non-record or arguments-less exec yields at most the primitive identity fields', () => {
++    expect(sandboxToolExec(undefined)).toBeUndefined()
++    expect(sandboxToolExec(null)).toBeUndefined()
++    const bare = sandboxToolExec({ callId: 'call-2' })
++    expect(bare).toEqual({ callId: 'call-2' })
++  })
++
++  it('a sandbox-defined tool execute receives only the view — never exec.agent.ctx', async () => {
++    const tool = sandboxDefineTool({
++      name: 'probe_exec_view',
++      description: 'Report which execution facts reached the sandbox.',
++      parameters: {},
++      output: {
++        schema: { type: 'object', additionalProperties: false, properties: {} },
++        render() { return [{ type: 'text' as const, text: '' }] },
++      },
++      async execute(_args: unknown, exec: unknown) {
++        const record = exec !== undefined && exec !== null && typeof exec === 'object' ? exec : undefined
++        const agent = record !== undefined && 'agent' in record ? (record as { agent?: unknown }).agent : undefined
++        return {
++          received: record !== undefined,
++          keys: record === undefined ? [] : Object.keys(record).sort(),
++          agentKeys: agent !== undefined && typeof agent === 'object'
++            ? Object.keys(agent as Record<string, unknown>).sort()
++            : null,
++          ctxExposed: agent !== undefined && typeof agent === 'object' && !!(agent as { ctx?: unknown }).ctx,
++        }
++      },
++    })
++    const result = await (tool as unknown as { execute(args: unknown, exec: unknown): Promise<unknown> }).execute(
++      {},
++      {
++        callId: 'call-3',
++        name: 'host_tool',
++        arguments: {},
++        agent: { id: 'agent-1', ctx: { root: {} } },
++      },
++    ) as { received: boolean; keys: string[]; agentKeys: string[] | null; ctxExposed: boolean }
++    expect(result.received).toBe(true)
++    expect(result.keys).not.toContain('agent')
++    expect(result.keys).toContain('callId')
++    expect(result.keys).toContain('arguments')
++    expect(result.agentKeys).toBeNull()
++    expect(result.ctxExposed).toBe(false)
++  })
++})
++
+ describe('sandbox context façade — inject gate on services', () => {
+   it('denies an undeclared live service (property access), naming the inject fix', async () => {
+     // `systemPrompt` is a live global service in the setup harness, but this
+diff --git a/packages/fs/fs-sandbox/src/index.ts b/packages/fs/fs-sandbox/src/index.ts
+index 60dd6b3bad..72710ea93d 100644
+--- a/packages/fs/fs-sandbox/src/index.ts
++++ b/packages/fs/fs-sandbox/src/index.ts
+@@ -4,8 +4,15 @@
+  * text-storage mechanics — resolve, stat, read/stream, list, the atomic
+  * write and the read-match-write edit critical section — are the local
+  * implementation's, verbatim; this package adds only the per-call POLICY fence
+- * on the two mutations. Reads pass through untouched: every mode permits
+- * reading.
++ * on the two mutations AND on policy-carrying content reads. Reads used to
++ * pass through untouched ("every mode permits reading"), which let a read-only
++ * session exfiltrate `~/.ssh/*`, `.env`, and credential files
++ * (QVD-2026-52632); a caller that resolves a per-session policy (the
++ * model-facing read tools always do) is now bounded to that policy's writable
++ * roots, and an out-of-root read under `read-only`/`workspace-write` throws
++ * the structured `FS_SANDBOX_DENIED`. Reads without a policy stay
++ * host-owned and unfenced, preserving internal consumers that read managed
++ * paths outside the workspace.
+  *
+  * The fence is a policy check in TRUSTED code over a MODEL-CONTROLLED path,
+  * NOT a kernel boundary — the operations are the seam's own (open, rename),
+@@ -17,8 +24,9 @@
+  * syscall) is narrowed by re-canonicalizing immediately before delegating and
+  * is accepted for this threat model.
+  *
+- * Per-call policy: `read-only` denies every mutation; `workspace-write` allows
+- * a mutation only when the target canonicalizes under the policy's workspace
++ * Per-call policy: `read-only` denies every mutation and every out-of-root
++ * read; `workspace-write` allows a mutation or read only when the target
++ * canonicalizes under the policy's workspace
+  * root or a platform temp area from the shared `writableRoots` policy;
+  * `danger-full-access` delegates unfenced. A denial throws the structured
+  * `FS_SANDBOX_DENIED`.
+@@ -66,6 +74,98 @@ export class SandboxedFileSystem extends LocalFileSystem {
+     return this.defaultMode
+   }
+ 
++  /**
++   * Fence a content read by the per-call policy, then delegate to the
++   * inherited reader. Reads previously bypassed the policy entirely; a
++   * sandboxed mode now reads only within its writable roots, so read-only
++   * sessions can no longer exfiltrate host secrets outside the workspace.
++   * @param target - the resolved target to read.
++   * @param signal - aborts the read.
++   * @param sandboxPolicy - the per-call mode and workspace root; omit to use
++   *   the deployment fallback.
++   * @returns the text content from the inherited backend.
++   */
++  override async readText(
++    target: FsTarget,
++    signal?: AbortSignal,
++    sandboxPolicy?: SandboxExecutionPolicy,
++  ): Promise<string> {
++    return super.readText(await this.checkedReadTarget(target, sandboxPolicy), signal)
++  }
++
++  /**
++   * Fence a streaming content read like {@link readText}; see there.
++   * @param target - the resolved target to read.
++   * @param signal - aborts the stream.
++   * @param sandboxPolicy - the per-call mode and workspace root; omit to use
++   *   the deployment fallback.
++   * @returns the inherited chunk iterable.
++   */
++  override async streamText(
++    target: FsTarget,
++    signal?: AbortSignal,
++    sandboxPolicy?: SandboxExecutionPolicy,
++  ): Promise<AsyncIterable<string>> {
++    return super.streamText(await this.checkedReadTarget(target, sandboxPolicy), signal)
++  }
++
++  /**
++   * Fence a raw-byte content read like {@link readText}; see there.
++   * @param target - the resolved target to read.
++   * @param signal - aborts the read.
++   * @param maxBytes - inclusive byte cap passed to the inherited reader.
++   * @param sandboxPolicy - the per-call mode and workspace root; omit to use
++   *   the deployment fallback.
++   * @returns the inherited raw content.
++   */
++  override async readBytes(
++    target: FsTarget,
++    signal: AbortSignal | undefined,
++    maxBytes: number,
++    sandboxPolicy?: SandboxExecutionPolicy,
++  ): Promise<Uint8Array> {
++    return super.readBytes(await this.checkedReadTarget(target, sandboxPolicy), signal, maxBytes)
++  }
++
++  /**
++   * Enforce the per-call policy against a READ target and return the EXACT
++   * target the read must use, mirroring {@link checkedTarget}. A caller that
++   * passes no policy is a host-owned read and keeps the legacy pass-through
++   * (the model-facing tools always resolve a per-session policy before
++   * reading, which is the surface QVD-2026-52632 is about). Under a policy,
++   * `read-only`/`workspace-write` re-canonicalize NOW and require containment
++   * under a writable root, throwing the structured `FS_SANDBOX_DENIED` for
++   * out-of-root reads; `danger-full-access` returns the caller's target
++   * unfenced.
++   */
++  private async checkedReadTarget(target: FsTarget, sandboxPolicy?: SandboxExecutionPolicy): Promise<FsTarget> {
++    if (sandboxPolicy === undefined) return target
++    const { mode } = sandboxPolicy
++    if (mode === 'danger-full-access') return target
++    const fresh = await this.resolve(target.displayPath)
++    // read-only grants the workspace as a READ root even though its writable
++    // roots are empty (that is the point of a read-only session: process the
++    // untrusted workspace without changing it). workspace-write shares the
++    // mutation containment.
++    const roots: string[] = mode === 'read-only'
++      ? [(await this.resolve(sandboxPolicy.workspaceRoot)).targetKey]
++      : writableRoots(sandboxPolicy)
++    let contained = false
++    for (const root of roots) {
++      if (await isPathUnder(fresh.targetKey, root)) {
++        contained = true
++        break
++      }
++    }
++    if (!contained) {
++      throw new FsError(
++        `cannot read "${target.displayPath}": file access denied under ${mode} mode (read is confined to the workspace)`,
++        'FS_SANDBOX_DENIED',
++      )
++    }
++    return fresh
++  }
++
+   /**
+    * Fence the write by the per-call policy, then delegate to the inherited
+    * atomic write. See {@link checkedTarget}.
+diff --git a/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts b/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts
+index 435086a301..4f43d89ad6 100644
+--- a/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts
++++ b/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts
+@@ -87,6 +87,51 @@ describe('read-only', () => {
+     await writeFile(path, 'hello')
+     expect(await fs.readText(await target(path))).toBe('hello')
+   })
++
++  it('denies an out-of-workspace read under an explicit read-only policy (QVD-2026-52632)', async () => {
++    const inside = join(workspace, 'inside.txt')
++    const secret = join(outside, 'secret.txt')
++    await writeFile(inside, 'ok')
++    await writeFile(secret, 'top')
++    const policy = ctx.sandboxPolicy.resolve()
++    // The workspace itself stays readable — a read-only session still
++    // processes the untrusted workspace it was pointed at.
++    expect(await fs.readText(await target(inside), undefined, policy)).toBe('ok')
++    // Host secrets outside the workspace are no longer silently readable.
++    await expect(fs.readText(await target(secret), undefined, policy))
++      .rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
++  })
++})
++
++describe('read containment parity', () => {
++  it('workspace-write confines policy-carrying reads to the writable roots', async () => {
++    await boot('workspace-write')
++    const inside = join(workspace, 'inside.txt')
++    const secret = join(outside, 'secret.txt')
++    await writeFile(inside, 'ok')
++    await writeFile(secret, 'top')
++    const policy = ctx.sandboxPolicy.resolve()
++    expect(await fs.readText(await target(inside), undefined, policy)).toBe('ok')
++    await expect(fs.readText(await target(secret), undefined, policy))
++      .rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
++  })
++
++  it('danger-full-access policy-carrying reads pass through unfenced', async () => {
++    await boot('danger-full-access')
++    const secret = join(outside, 'secret.txt')
++    await writeFile(secret, 'top')
++    const policy = ctx.sandboxPolicy.resolve()
++    expect(await fs.readText(await target(secret), undefined, policy)).toBe('top')
++  })
++
++  it('reads without a policy remain host-owned pass-throughs (host paths are unaffected)', async () => {
++    await boot('read-only')
++    const secret = join(outside, 'secret.txt')
++    await writeFile(secret, 'top')
++    // Legacy direct-service reads (skills, sessions, LSP) resolve no policy
++    // and keep reading managed paths outside the workspace.
++    expect(await fs.readText(await target(secret))).toBe('top')
++  })
+ })
+ 
+ describe('workspace-write containment', () => {
+diff --git a/packages/fs/fs/src/index.ts b/packages/fs/fs/src/index.ts
+index e32890d732..e140b1bd2b 100644
+--- a/packages/fs/fs/src/index.ts
++++ b/packages/fs/fs/src/index.ts
+@@ -184,9 +184,12 @@ export abstract class FileSystem extends Service {
+    * Read the whole regular text file as a single decoded string.
+    * @param target - the resolved target to read.
+    * @param signal - aborts the read.
++   * @param sandboxPolicy - the per-call mode and workspace root this read runs
++   *   under; a sandboxing backend fences the read by it, the bare backend
++   *   ignores it. Omit to leave the backend its own default.
+    * @returns the full decoded UTF-8 content.
+    */
+-  abstract readText(target: FsTarget, signal?: AbortSignal): Promise<string>
++  abstract readText(target: FsTarget, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy): Promise<string>
+ 
+   /**
+    * Stream the whole regular text file as decoded text chunks (same text
+@@ -195,9 +198,12 @@ export abstract class FileSystem extends Service {
+    * touches raw bytes.
+    * @param target - the resolved target to read.
+    * @param signal - aborts the stream, including between chunks.
++   * @param sandboxPolicy - the per-call mode and workspace root this read runs
++   *   under; a sandboxing backend fences the read by it, the bare backend
++   *   ignores it. Omit to leave the backend its own default.
+    * @returns the chunk iterable, decoded and validated like {@link readText}.
+    */
+-  abstract streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>>
++  abstract streamText(target: FsTarget, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy): Promise<AsyncIterable<string>>
+ 
+   /**
+    * Read the whole regular file as raw bytes with no decoding or binary
+@@ -207,9 +213,12 @@ export abstract class FileSystem extends Service {
+    * @param target - the resolved target to read.
+    * @param signal - aborts the read.
+    * @param maxBytes - inclusive byte cap on the complete content.
++   * @param sandboxPolicy - the per-call mode and workspace root this read runs
++   *   under; a sandboxing backend fences the read by it, the bare backend
++   *   ignores it. Omit to leave the backend its own default.
+    * @returns the full raw content, at most `maxBytes` long.
+    */
+-  abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array>
++  abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number, sandboxPolicy?: SandboxExecutionPolicy): Promise<Uint8Array>
+ 
+   /**
+    * List direct children of a directory in stable name order. Returns resolved
+diff --git a/packages/fs/tool-fs/src/index.ts b/packages/fs/tool-fs/src/index.ts
+index cfbec13cda..c76247be55 100644
+--- a/packages/fs/tool-fs/src/index.ts
++++ b/packages/fs/tool-fs/src/index.ts
+@@ -58,22 +58,23 @@ export function apply(ctx: Context, config: Config): void {
+   assertPositiveInteger('readMaxLineLength', resolved.readMaxLineLength)
+   assertPositiveInteger('readMaxBytes', resolved.readMaxBytes)
+   assertPositiveInteger('readStreamMinSize', resolved.readStreamMinSize)
++  // One escalation API shared by the fs tools: advertisement gating, per-call
++  // policy resolution (writes AND reads — a read-only session must not read
++  // outside its workspace, QVD-2026-52632), and denial-marker mapping, all
++  // keyed off whether the mounted ctx.fs confines (ctx.fs.sandboxMode).
++  const sandbox = new FsSandboxController(ctx)
+   applyReadTool(ctx, {
+     limit: resolved.readLimit,
+     maxLineLength: resolved.readMaxLineLength,
+     maxBytes: resolved.readMaxBytes,
+     streamMinSize: resolved.readStreamMinSize,
+-  })
++  }, sandbox)
+   // read_image is composition-conditional: without a mounted attachment store
+   // the deployment cannot durably commit image bytes, so the tool never
+   // registers; the execute body keeps a defensive re-check for direct callers.
+   ctx.inject(['attachments'], (imageCtx) => {
+-    applyReadImageTool(imageCtx)
++    applyReadImageTool(imageCtx, sandbox)
+   })
+-  // One escalation API shared by both mutating tools: advertisement gating,
+-  // per-call policy resolution, and denial-marker mapping, all keyed off whether
+-  // the mounted ctx.fs confines (ctx.fs.sandboxMode).
+-  const sandbox = new FsSandboxController(ctx)
+   applyWriteTool(ctx, sandbox)
+   applyEditTool(ctx, sandbox)
+ }
+diff --git a/packages/fs/tool-fs/src/read-image.ts b/packages/fs/tool-fs/src/read-image.ts
+index b1cbad9bb9..5f06afe104 100644
+--- a/packages/fs/tool-fs/src/read-image.ts
++++ b/packages/fs/tool-fs/src/read-image.ts
+@@ -17,6 +17,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
+ import type { GenericCallView, ToolExecution } from '@deepseek-ai/dsh-tools'
+ import type {} from '@deepseek-ai/dsh-fs'
+ import { resolveRegularReadTarget } from './read-target.ts'
++import type { FsEscalationArgs, FsSandboxController } from './sandbox.ts'
+ 
+ /** Extensions `read_image` accepts; magic-byte validation at the attachment service stays authoritative. */
+ const IMAGE_EXTENSIONS: Readonly<Record<string, ImageMediaType>> = {
+@@ -165,8 +166,11 @@ function imageReadContent(value: ImageReadValue): ContentBlock[] {
+  * direct callers and gates on the calling route's declared image input.
+  * @param ctx - the registration scope; execution uses its `fs` service plus
+  *   the optional `attachments`/`llm` services.
++ * @param sandbox - the shared sandbox API; when present (a confining `ctx.fs`),
++ *   reads resolve the session's policy so the backend confines content reads
++ *   to the workspace (QVD-2026-52632).
+  */
+-export function applyReadImageTool(ctx: Context): void {
++export function applyReadImageTool(ctx: Context, sandbox?: FsSandboxController): void {
+   ctx.tools.register(defineTool({
+     name: 'read_image',
+     description: 'Read a PNG/JPEG/WebP/GIF file and return the image itself. '
+@@ -212,7 +216,16 @@ export function applyReadImageTool(ctx: Context): void {
+       // The tool result is one message carrying one image, so the per-message
+       // aggregate bound applies beside the per-image bound.
+       const byteCap = Math.min(attachments.imageLimits.maxImageBytes, attachments.imageLimits.maxMessageImageBytes)
+-      const data = await ctx.fs.readBytes(target, exec.signal, byteCap)
++      // QVD-2026-52632: resolve the session's sandbox policy before reading so
++      // the backend confines policy-carrying reads to the workspace.
++      const sandboxPolicy = sandbox === undefined ? undefined : await sandbox.resolvePolicy('read_image', args as FsEscalationArgs, exec)
++      let data: Uint8Array
++      try {
++        data = await ctx.fs.readBytes(target, exec.signal, byteCap, sandboxPolicy)
++      } catch (error: unknown) {
++        if (sandbox !== undefined && sandboxPolicy !== undefined) throw sandbox.mapError(error, sandboxPolicy)
++        throw error
++      }
+       // Persist before returning: the image block must reference a durably
+       // committed object by the time the tool/result event is appended.
+       let ref: ImageAttachmentRef
+diff --git a/packages/fs/tool-fs/src/read.ts b/packages/fs/tool-fs/src/read.ts
+index bd0154893f..56a84cd3af 100644
+--- a/packages/fs/tool-fs/src/read.ts
++++ b/packages/fs/tool-fs/src/read.ts
+@@ -10,6 +10,7 @@ import type { GenericCallView, ReadResultView, ToolResult } from '@deepseek-ai/d
+ import type {} from '@deepseek-ai/dsh-fs'
+ import { buildWindow, formatReadOutput, langFromPath, readMetaFromMeta } from './read-render.ts'
+ import { resolveRegularReadTarget } from './read-target.ts'
++import type { FsEscalationArgs, FsSandboxController } from './sandbox.ts'
+ 
+ /** Default and maximum number of lines returned by one `read` call (the `readLimit` config). */
+ export const READ_LIMIT = 2000
+@@ -64,8 +65,11 @@ export function parseReadArgs(args: { file_path: string; offset?: number; limit?
+  * Register the `read` tool and its system-prompt guidance.
+  * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
+  * @param caps - the deployment's resolved read caps (plugin config after defaulting).
++ * @param sandbox - the shared sandbox API; when present (a confining `ctx.fs`),
++ *   every read resolves the session's sandbox policy so the backend confines
++ *   content reads to the workspace (QVD-2026-52632).
+  */
+-export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
++export function applyReadTool(ctx: Context, caps: ReadToolCaps, sandbox?: FsSandboxController): void {
+   ctx.systemPrompt.section({
+     name: 'tool:read',
+     order: ctx.systemPrompt.getSectionOrder('TOOL_READ'),
+@@ -138,28 +142,38 @@ export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
+       // A concurrent write can only make a later guarded mutation fail stale and require reread.
+       const { target, info } = await resolveRegularReadTarget(ctx, exec, input.filePath)
+ 
+-      // Stream when the file is large OR size is unknown, so a size-less backend
+-      // never buffers an arbitrarily large file.
+-      const chunks = info.size === undefined || info.size >= caps.streamMinSize
+-        ? await ctx.fs.streamText(target, exec.signal)
+-        : [await ctx.fs.readText(target, exec.signal)]
+-      const window = await buildWindow(
+-        chunks,
+-        { offset: input.offset, limit: input.limit, maxLineLength: caps.maxLineLength, maxBytes: caps.maxBytes },
+-        target.displayPath,
+-      )
++      // QVD-2026-52632: resolve the session's sandbox policy before any content
++      // read. Under a confining backend the fs service confines policy-carrying
++      // reads to the workspace; a denial is mapped to the shared [sandbox: …]
++      // marker the same way a write denial is.
++      const sandboxPolicy = sandbox === undefined ? undefined : await sandbox.resolvePolicy('read', args as FsEscalationArgs, exec)
++      try {
++        // Stream when the file is large OR size is unknown, so a size-less backend
++        // never buffers an arbitrarily large file.
++        const chunks = info.size === undefined || info.size >= caps.streamMinSize
++          ? await ctx.fs.streamText(target, exec.signal, sandboxPolicy)
++          : [await ctx.fs.readText(target, exec.signal, sandboxPolicy)]
++        const window = await buildWindow(
++          chunks,
++          { offset: input.offset, limit: input.limit, maxLineLength: caps.maxLineLength, maxBytes: caps.maxBytes },
++          target.displayPath,
++        )
+ 
+-      const outcome = {
+-        path: target.displayPath,
+-        offset: input.offset,
+-        lines: window.lines,
+-        totalLines: window.totalLines,
++        const outcome = {
++          path: target.displayPath,
++          offset: input.offset,
++          lines: window.lines,
++          totalLines: window.totalLines,
++        }
++        // Record the present observation (a no-op when no policy plugin listens). The
++        // read already succeeded; an fs/observed listener is contractually a
++        // synchronous, side-effect-only recorder.
++        ctx.emit('fs/observed', target, { kind: 'present', version: info.version }, exec)
++        return outcome
++      } catch (error: unknown) {
++        if (sandbox !== undefined && sandboxPolicy !== undefined) throw sandbox.mapError(error, sandboxPolicy)
++        throw error
+       }
+-      // Record the present observation (a no-op when no policy plugin listens). The
+-      // read already succeeded; an fs/observed listener is contractually a
+-      // synchronous, side-effect-only recorder.
+-      ctx.emit('fs/observed', target, { kind: 'present', version: info.version }, exec)
+-      return outcome
+     },
+     // Result-time display: a `read` card carrying the structured line window a
+     // capable UI renders as a line-numbered, syntax-highlighted view. The
+diff --git a/packages/shell/bash-local/src/index.ts b/packages/shell/bash-local/src/index.ts
+index 064f124a00..5b4b57eaf8 100644
+--- a/packages/shell/bash-local/src/index.ts
++++ b/packages/shell/bash-local/src/index.ts
+@@ -192,6 +192,13 @@ export class LocalBashExecutor extends ShellExecutor {
+       },
+       graceMs: this.config.graceMs,
+       signal,
++      // A restrictive policy reaches this spawn only after the sandboxing
++      // executor wrapped argv through ctx.sandbox.confine, so declare the
++      // confinement at the execution point; the subprocess provider refuses a
++      // restricted-policy spawn that does not declare it (QVD-2026-52646).
++      ...spec.sandboxPolicy !== undefined && spec.sandboxPolicy.mode !== 'danger-full-access'
++        ? { sandboxPolicy: spec.sandboxPolicy, argvConfined: true as const }
++        : {},
+       // One explicit env map for the seam, layered so the trusted dshEnv
+       // snapshot beats both the caller's env and the terminal overrides; the
+       // subprocess service merges the whole map after its ambient scrub.
+diff --git a/packages/shell/pwsh-local/src/index.ts b/packages/shell/pwsh-local/src/index.ts
+index 93133b37af..ac5214a71d 100644
+--- a/packages/shell/pwsh-local/src/index.ts
++++ b/packages/shell/pwsh-local/src/index.ts
+@@ -239,6 +239,13 @@ export class PwshLocalExecutor extends ShellExecutor {
+       },
+       graceMs: this.config.graceMs,
+       signal,
++      // A restrictive policy reaches this spawn only after the sandboxing
++      // executor wrapped argv through ctx.sandbox.confine, so declare the
++      // confinement at the execution point; the subprocess provider refuses a
++      // restricted-policy spawn that does not declare it (QVD-2026-52646).
++      ...spec.sandboxPolicy !== undefined && spec.sandboxPolicy.mode !== 'danger-full-access'
++        ? { sandboxPolicy: spec.sandboxPolicy, argvConfined: true as const }
++        : {},
+       env: { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv },
+     }
+   }
+diff --git a/packages/subprocess/subprocess-local/src/spawn.ts b/packages/subprocess/subprocess-local/src/spawn.ts
+index 433ba01791..3d16a55a0a 100644
+--- a/packages/subprocess/subprocess-local/src/spawn.ts
++++ b/packages/subprocess/subprocess-local/src/spawn.ts
+@@ -314,6 +314,28 @@ function signalTree(
+   }
+ }
+ 
++/**
++ * Refuse a spawn that declares a restrictive sandbox policy without a
++ * confined argv. Sandbox constraints live in the argv wrapper the shell
++ * executors build through `ctx.sandbox.confine`; without this check a caller
++ * that resolves a `read-only`/`workspace-write` policy but forgets the
++ * confinement would launch an unconstrained child — the exact seam hole of
++ * QVD-2026-52646. The check sits at the execution point (the one place every
++ * spawn must cross), so a policy can never silently degrade to a bare spawn.
++ * `danger-full-access` and policy-less spawns are unchanged.
++ * @param spec - the fully-specified spawn request.
++ * @throws when a restrictive policy is declared without {@link SubprocessSpawnSpec.argvConfined}.
++ */
++export function assertConfinedUnderPolicy(spec: SubprocessSpawnSpec): void {
++  const mode = spec.sandboxPolicy?.mode
++  if (mode !== undefined && mode !== 'danger-full-access' && spec.argvConfined !== true) {
++    throw new Error(
++      'subprocess: refusing an unconfined spawn under a restricted sandbox policy (mode "'
++      + mode + '"); the argv must be confined by a sandbox backend before reaching the execution point',
++    )
++  }
++}
++
+ /**
+  * Spawn one isolated detached process tree with the spec's per-stream stdio
+  * dispositions. Runtime exits resolve `done` as {@link SubprocessOutcome};
+@@ -335,6 +357,7 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
+   if (spec.signal?.aborted) {
+     throw new Error(`aborted before spawn: ${String(spec.signal.reason ?? 'aborted')}`)
+   }
++  assertConfinedUnderPolicy(spec)
+   const [program, ...args] = spec.argv
+   if (program === undefined || program.length === 0) {
+     throw new Error('invalid argv: expected a non-empty program name at argv[0]')
+diff --git a/packages/subprocess/subprocess-local/tests/spawn.spec.ts b/packages/subprocess/subprocess-local/tests/spawn.spec.ts
+index 1f21dfaaa1..48818cbde3 100644
+--- a/packages/subprocess/subprocess-local/tests/spawn.spec.ts
++++ b/packages/subprocess/subprocess-local/tests/spawn.spec.ts
+@@ -1009,6 +1009,37 @@ describe('argv validation', () => {
+     expect(() => spawnSubprocess({ ...spec('true'), argv: [''] })).toThrow(/non-empty program name/)
+   })
+ 
++  it('refuses a restricted-policy spawn whose argv is not confined (QVD-2026-52646)', () => {
++    expect(() => spawnSubprocess({
++      ...spec('true'),
++      sandboxPolicy: { mode: 'workspace-write', workspaceRoot: process.cwd() },
++    })).toThrow(/unconfined spawn under a restricted sandbox policy/)
++
++    expect(() => spawnSubprocess({
++      ...spec('true'),
++      sandboxPolicy: { mode: 'read-only', workspaceRoot: process.cwd() },
++    })).toThrow(/unconfined spawn under a restricted sandbox policy/)
++  })
++
++  it('accepts a restricted-policy spawn that declares a confined argv', async () => {
++    const result = await finish(spawnSubprocess({
++      ...spec('true'),
++      sandboxPolicy: { mode: 'workspace-write', workspaceRoot: process.cwd() },
++      argvConfined: true,
++    }))
++    expect(result.exitCode).toBe(0)
++  })
++
++  it('ignores the confinement contract for danger-full-access and policy-less spawns', async () => {
++    const full = await finish(spawnSubprocess({
++      ...spec('true'),
++      sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: process.cwd() },
++    }))
++    expect(full.exitCode).toBe(0)
++    const bare = await finish(spawnSubprocess(spec('true')))
++    expect(bare.exitCode).toBe(0)
++  })
++
+   it.skipIf(process.platform === 'win32')('spawns argv verbatim without shell interpretation', async () => {
+     const result = await finish(spawnSubprocess({ ...spec('unused'), argv: ['printf', '%s', '$HOME'] }))
+     expect(result.stdout.text).toBe('$HOME')
+diff --git a/packages/subprocess/subprocess/src/types.ts b/packages/subprocess/subprocess/src/types.ts
+index 5d86f098d4..005b0cf270 100644
+--- a/packages/subprocess/subprocess/src/types.ts
++++ b/packages/subprocess/subprocess/src/types.ts
+@@ -101,6 +101,22 @@ export interface SubprocessSpawnSpec {
+    * tombstone that removes an ordinary ambient entry from the child.
+    */
+   env?: NodeJS.ProcessEnv | undefined
++  /**
++   * Optional declared sandbox policy for this spawn. A spawn under a
++   * restrictive policy (`read-only`/`workspace-write`) is a *confined*
++   * launch: the implementation refuses it unless {@link argvConfined} is
++   * true, so sandbox constraints cannot silently evaporate at the execution
++   * point (QVD-2026-52646). The policy is a structural contract, not the
++   * `@deepseek-ai/dsh-sandbox` type — this seam stays dependency-free.
++   */
++  sandboxPolicy?: { readonly mode: 'read-only' | 'workspace-write' | 'danger-full-access'; readonly workspaceRoot?: string } | undefined
++  /**
++   * True when the caller already confined `argv` through its sandbox backend
++   * (e.g. a `ctx.sandbox.confine`-wrapped argv from the sandboxed shell
++   * executors). Required for any spawn declaring a restrictive
++   * {@link sandboxPolicy}; ignored for `danger-full-access` or no policy.
++   */
++  argvConfined?: boolean | undefined
+ }
+ 
+ /**
+diff --git a/vendor/README.md b/vendor/README.md
+index 4cfbe892de..e88da11ec9 100644
+--- a/vendor/README.md
++++ b/vendor/README.md
+@@ -49,6 +49,8 @@ Keep this log exhaustive — every divergence from upstream must be listed.
+ 17. **`@deepseek-ai` rescope**: every vendored manifest `name`, every internal dependency entry among the vendored set, and every module specifier that reaches them use the scoped names in the manifest table's `npm name` column. Directory names, version numbers, and dependency ranges are unchanged, and no upstream runtime identifier is renamed — `Symbol.for('schemastery')` and Schemastery's `vendor:` metadata field keep their upstream values. Re-apply with `pnpm run rescope-vendor --apply` after a sync; the table's two name columns are the mapping, restated for consumers in [docs/rescope.md](../docs/rescope.md).
+ 18. **Entry `disabled` interpolation in `loader/src/config/entry.ts`**: a `disabled: !!js` expression evaluates against the loader context at every mount decision; the raw node stays in the options, so write-back keeps the `!!js` form. `disabled` is the only interpolated metadata field. Covered by `packages/boot/app-boot/tests/user-patches.spec.ts` and `apps/cli/tests/windows-shell.spec.ts`.
+ 19. **`loader/src/internal.ts` runtime shape detection**: `ModuleLoader.fromInternal()` classifies the internal loader by which module-job API it owns — `getOrCreateModuleJob` for v2, `getModuleJobForImport` for v1 — instead of by Node major version. Upstream tags every major `>= 24` as v2, but the v2 interface arrived in Node 24.12.0, so 24.0–24.11.1 report major 24 while still carrying the v1 loader; consumers then called `resolveSync` with reversed parameters and every call threw. `dsh web` served an empty client graph (`__DSH_BOOT__.entries: []`) and HMR partial reload resolved no entry URL, both behind swallowed or warn-level errors. Arity cannot discriminate the two shapes, because each reports `resolveSync.length === 2`. A loader owning neither API is left unclassified rather than guessed, so consumers take their documented no-internals path. Covered on the `node-compat` Node version matrix, which pins 24.9 for the mistagged range.
++20. **`loader/src/config/utils.ts` vm-isolated `!!js` evaluation (QVD-2026-52631)**: the upstream `evaluate` (`new Function('ctx','expr','with(ctx){return eval(expr)}')`) lets a `!!js` expression fall through the loader context to the host global scope, where `process` and `process.getBuiltinModule()` provide arbitrary code execution at config-load time. It now evaluates each expression in a fresh `node:vm` context that contains no host object: the loader context's data chain is JSON-projected across the vm boundary, and `process` (read-only `env` snapshot, `platform`, `execPath`, `cwd`, `getBuiltinModule` limited to `node:url`), `dshHomePath`, and the minimal file-URL `URL`/`fileURLToPath` helpers are rebuilt inside the vm realm, so host reach via direct identifiers and via `Function`-constructor chains is gone while the shipped expression vocabulary keeps working. `interpolate`/`isJsExpr`/`JsExpr` are unchanged. The data projection drops function-valued context members and accessor-only properties; an expression that referenced one now fails loud instead of reaching the host.
++
+ 
+ ## Sync procedure
+ 
+diff --git a/vendor/loader/src/config/utils.ts b/vendor/loader/src/config/utils.ts
+index cd706c0407..d8fed77eff 100644
+--- a/vendor/loader/src/config/utils.ts
++++ b/vendor/loader/src/config/utils.ts
+@@ -1,12 +1,271 @@
++/**
++ * Namespace imports (never named imports) for the Node builtins this module
++ * needs at evaluation time. The vendored loader is also bundled into the
++ * browser application, where Vite externalizes `node:*` modules; a named
++ * import (`import { join } from 'node:path'`) makes the browser build fail
++ * with "not exported by __vite-browser-external", while namespace access
++ * compiles everywhere and only touches the real modules when evaluation
++ * actually runs on a Node host. Config expression evaluation is a host-only
++ * path; the browser never reaches it.
++ */
++import * as nodeOs from 'node:os'
++import * as nodePath from 'node:path'
++import * as nodeVm from 'node:vm'
+ import { valueMap } from '@deepseek-ai/cosmokit'
+ 
+-// eslint-disable-next-line no-new-func
+-/** Evaluate a JavaScript expression against a loader context scope. */
+-export const evaluate = new Function('ctx', 'expr', `
+-  with (ctx) {
+-    return eval(expr)
++/**
++ * Loader `!!js` expression evaluation, isolated from the host realm.
++ *
++ * A configuration expression is attacker-influenceable content (a patch file
++ * a compromised agent or a cloned repository can place), so it must never
++ * evaluate with reach to the Node host: `with (ctx) { eval(expr) }` inside a
++ * `new Function` falls through `ctx` to the host global scope, where
++ * `process` and — on Node 22.3+ — `process.getBuiltinModule()` turn one
++ * `!!js` scalar into arbitrary code execution at load time
++ * (QVD-2026-52631).
++ *
++ * Expressions now run inside a fresh `node:vm` context that contains no host
++ * object: a JSON-safe projection of the loader context's data chain plus
++ * vm-local helpers built from plain data. Inside the vm realm the `Function`
++ * constructor creates functions bound to the vm global, which has no host
++ * `process`, so neither direct identifiers nor constructor-chain escapes
++ * reach the host. ECMAScript intrinsics (`JSON`, `Math`, `Number`, `String`,
++ * `decodeURIComponent`, …) remain available, which covers the shipped
++ * expression vocabulary (`process.env` / `process.cwd()` /
++ * `process.platform` / `process.execPath` / `dshHomePath` / file-URL
++ * resolution).
++ */
++
++/** Data-only copy of one value: primitives and JSON-plain containers pass; anything else is dropped. */
++function projectData(value: unknown, depth = 0): unknown {
++  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
++  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
++  if (typeof value === 'bigint' || typeof value === 'symbol' || typeof value === 'function') return undefined
++  if (typeof value !== 'object' || depth > 24) return undefined
++  if (Array.isArray(value)) {
++    const output: unknown[] = []
++    for (const item of value) {
++      const projected = projectData(item, depth + 1)
++      if (projected !== undefined || item === null) output.push(projected)
++    }
++    return output
++  }
++  const prototype: unknown = Object.getPrototypeOf(value)
++  if (prototype !== null && prototype !== Object.prototype) return undefined
++  const output: Record<string, unknown> = {}
++  for (const key of Object.keys(value)) output[key] = projectData((value as Record<string, unknown>)[key], depth + 1)
++  return output
++}
++
++/**
++ * Walk one context's prototype chain (Cordis scopes link through prototypes)
++ * and project the nearest own string-keyed DATA properties into a plain
++ * record. Functions, classes, accessors, and service instances never cross —
++ * they are exactly the handles a same-realm evaluator could climb to the
++ * host. The nearest definition wins, mirroring identifier resolution through
++ * `with (ctx)`.
++ *
++ * `ctx.provide(name, value)` values (the `webStartup`/`headlessStartup`-style
++ * objects config expressions read) live in the root fiber's provider store,
++ * not as own properties, so the store is enumerated in addition to the chain
++ * walk; only plain-data values are projected. Everything is read through
++ * optional access and per-entry try/catch so an unavailable store or a
++ * throwing provider never aborts evaluation.
++ * @param ctx - the loader (entry) context an expression evaluates against.
++ * @returns the data-only view exposed to vm-realm expressions.
++ */
++function projectContext(ctx: object): Record<string, unknown> {
++  const output: Record<string, unknown> = {}
++  const seen = new Set<string>()
++  const adopt = (name: string, value: unknown): void => {
++    if (seen.has(name)) return
++    const projected = projectData(value)
++    if (projected !== undefined) {
++      seen.add(name)
++      output[name] = projected
++    }
++  }
++  let current: object | null = ctx
++  while (current !== null && current !== Object.prototype) {
++    for (const name of Object.getOwnPropertyNames(current)) {
++      if (seen.has(name) || name === '__proto__' || name === 'constructor') continue
++      const descriptor = Object.getOwnPropertyDescriptor(current, name)
++      if (descriptor === undefined || !('value' in descriptor)) continue
++      seen.add(name)
++      const projected = projectData(descriptor.value)
++      if (projected !== undefined) output[name] = projected
++    }
++    current = Object.getPrototypeOf(current)
++  }
++  // Cordis `ctx.provide` stores provider implementations on the owning
++  // fiber's store, keyed by an isolation symbol — the values config
++  // expressions read (webStartup, headlessStartup, …) live there. The root
++  // fiber's store is the one a composition seeds before the Loader mounts;
++  // sibling entry fibers (a provider row mounted next to a consumer row whose
++  // config is being interpolated) register on their OWN fiber's store, so the
++  // whole live fiber tree is scanned as a lower-priority fallback. Only
++  // plain-data values are projected; functions, classes, and service
++  // instances never cross.
++  try {
++    const root = (ctx as { root?: unknown }).root ?? ctx
++    const fiber = (root as { fiber?: { store?: Record<string, unknown> } }).fiber
++    const store = fiber?.store
++    if (store !== undefined && typeof store === 'object') {
++      for (const name of Object.keys(store)) {
++        if (seen.has(name) || name === '__proto__' || name === 'constructor') continue
++        const impl = (store as Record<string, { value?: unknown } | unknown>)[name]
++        const value = typeof impl === 'object' && impl !== null && 'value' in impl
++          ? (impl as { value?: unknown }).value
++          : undefined
++        adopt(name, value)
++      }
++    }
++    // Whole-tree fallback: every active fiber's provider store, so a provider
++    // entry in the same tree as the consumer is visible to its expressions.
++    const registry = (root as { registry?: { values?: () => Iterable<{ fibers?: Iterable<{ store?: Record<string, unknown> }> }> } }).registry
++    const runtimes = registry?.values === undefined ? [] : [...registry.values()]
++    for (const runtime of runtimes) {
++      for (const rowFiber of runtime.fibers ?? []) {
++        const rowStore = rowFiber.store
++        if (rowStore === undefined || typeof rowStore !== 'object') continue
++        for (const name of Object.keys(rowStore)) {
++          if (seen.has(name) || name === '__proto__' || name === 'constructor') continue
++          const impl = (rowStore as Record<string, { value?: unknown } | unknown>)[name]
++          const value = typeof impl === 'object' && impl !== null && 'value' in impl
++            ? (impl as { value?: unknown }).value
++            : undefined
++          adopt(name, value)
++        }
++      }
++    }
++  } catch {
++    // A provider store is an optimization, never a boot prerequisite.
++  }
++  return output
++}
++
++/** Resolve the effective Harness home the same way `dshHomePath` does: `$DSH_HOME` else `~/.dsh`. */
++function harnessHomeBase(): string {
++  const fromEnv = process.env.DSH_HOME
++  const selected = fromEnv !== undefined && fromEnv.trim().length > 0 ? fromEnv : nodePath.join(nodeOs.homedir(), '.dsh')
++  const expanded = selected === '~'
++    ? nodeOs.homedir()
++    : selected.startsWith('~/') || selected.startsWith('~\\') ? nodePath.join(nodeOs.homedir(), selected.slice(2)) : selected
++  return nodePath.resolve(expanded)
++}
++
++/**
++ * vm-realm prelude: rebuilds every context value INSIDE the vm so no host
++ * object (whose constructor chains reach the host `Function`) is ever
++ * reachable from an expression. Context data arrives as one JSON string and
++ * is parsed in this realm; the process facade, `dshHomePath`, and the
++ * minimal file-URL `URL`/`fileURLToPath` helpers are all defined here from
++ * plain data, then the injected carrier is removed.
++ */
++const VM_PRELUDE = `
++(() => {
++  const carrier = globalThis.__dsh
++  delete globalThis.__dsh
++  const data = JSON.parse(carrier.dataJson)
++  for (const key of Object.keys(data)) globalThis[key] = data[key]
++  const ctx = data
++  // Legacy loader expressions may look services up through ctx.get(name).
++  // Back it with a data-only resolver over the projected view: it answers
++  // provided values (and undefined for anything else) without ever touching
++  // a live host service.
++  ctx.get = (name) => (Object.prototype.hasOwnProperty.call(ctx, name) ? ctx[name] : undefined)
++  globalThis.ctx = ctx
++  const sepChar = carrier.sep
++  const joinSegments = (base, segs) => {
++    let out = base
++    for (const seg of segs) {
++      if (!seg) continue
++      const last = out.charCodeAt(out.length - 1)
++      const hasSep = last === 47 || last === 92
++      out = hasSep ? out + seg : out + sepChar + seg
++    }
++    return out
++  }
++  globalThis.dshHomePath = (...segs) => joinSegments(ctx.dshHomeBase, segs)
++  const decodePathname = (pathname) => {
++    try { return decodeURIComponent(pathname) } catch { return pathname }
++  }
++  const fileURLToPath = (url) => {
++    const href = typeof url === 'string'
++      ? url
++      : url !== null && typeof url === 'object' && typeof url.href === 'string' ? url.href : ''
++    if (typeof href !== 'string' || !href.startsWith('file://')) {
++      throw new Error('config expression: fileURLToPath supports file:// URLs only')
++    }
++    let path = href.slice('file://'.length)
++    path = path.replace(/^localhost\\//i, '/')
++    if (/^\\/[A-Za-z]:\\//.test(path)) path = path.slice(1)
++    return decodePathname(path)
++  }
++  class URL {
++    constructor(input, base) {
++      if (typeof input !== 'string') throw new TypeError('config expression: URL input must be a string')
++      const absolute = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(input)
++      this.href = absolute || base === undefined || base === null ? String(input) : String(base) + input
++      this.pathname = this.href
++    }
+   }
+-`) as ((ctx: object, expr: string) => any)
++  globalThis.URL = URL
++  globalThis.fileURLToPath = fileURLToPath
++  const env = {}
++  for (const key of Object.keys(carrier.env)) env[key] = carrier.env[key]
++  globalThis.process = {
++    env: Object.freeze(env),
++    platform: carrier.platform,
++    arch: carrier.arch,
++    version: carrier.version,
++    execPath: carrier.execPath,
++    cwd: () => carrier.cwd,
++    getBuiltinModule(name) {
++      if (name === 'node:url') return { fileURLToPath }
++      throw new Error('config expression: process.getBuiltinModule(' + JSON.stringify(name)
++        + ') is not available; only node:url is exposed')
++    },
++  }
++})()
++`
++
++/**
++ * Evaluate a JavaScript expression against a loader context scope.
++ *
++ * Every evaluation builds a fresh vm context whose values are reconstructed
++ * inside the vm realm (context data crosses as one JSON string), so no host
++ * object — and therefore no host `process`/`Function` — is reachable from
++ * the expression. A runaway expression is bounded by the synchronous vm
++ * timeout.
++ * @param ctx - the loader (entry) context the expression resolves against.
++ * @param expr - the `!!js` expression text.
++ * @returns the evaluated value.
++ */
++export function evaluate(ctx: object, expr: string): any {
++  const projection = projectContext(ctx)
++  const dataJson = JSON.stringify({
++    ...projection,
++    // Always present regardless of the composition: the home base the
++    // `dshHomePath` helper resolves against.
++    dshHomeBase: harnessHomeBase(),
++  })
++  const sandbox: Record<string, unknown> = {
++    __dsh: {
++      dataJson,
++      env: process.env,
++      platform: process.platform,
++      arch: process.arch,
++      version: process.version,
++      execPath: process.execPath,
++      cwd: process.cwd(),
++      sep: nodePath.sep,
++    },
++  }
++  const context = nodeVm.createContext(sandbox)
++  nodeVm.runInContext(VM_PRELUDE, context, { timeout: 1_000 })
++  return nodeVm.runInContext(expr, context, { timeout: 1_000 })
++}
+ 
+ /** Recursively replace YAML `!js` expression nodes with evaluated values. */
+ export function interpolate(ctx: object, value: any) {
