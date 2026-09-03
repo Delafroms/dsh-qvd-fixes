@@ -1,4 +1,6 @@
-# 修复改动清单（QVD 五个漏洞）
+# 修复改动清单（QVD）
+
+> 定位：本补丁是**针对 0.1.2-alpha.2 的社区补丁**——4 个漏洞（52631 / 52632 / 52644 / 52646）有源码修改；57410 为该基线内已有修复的版本核验，未做改动。非官方安全更新，也非完整安全审计。
 
 本清单与 `fixes.patch` 配套：`fixes.patch` 是相对 DeepSeek Harness **0.1.2-alpha.2**（修复前基线）的统一 diff，可对任意基于该版本的检出执行：
 
@@ -33,6 +35,7 @@ git apply fixes.patch           rem 应用
 ### QVD-2026-52632 — fs-sandbox 读逃逸
 - `fs-sandbox` 的 `readText`/`streamText`/`readBytes` 增加可选 `sandboxPolicy` 参数，经 `checkedReadTarget` 校验目标：read-only 只允许 workspaceRoot，workspace-write 使用 writableRoots，越界抛结构化 `FS_SANDBOX_DENIED`。
 - `tool-fs` 的 `FsSandboxController` 在读前解析会话策略并传入 fs 读方法，denial 经 `sandbox.mapError` 映射；无策略时透传（不影响宿主自有读取）。
+- **已知残留（本补丁未覆盖）**：进程级沙箱后端在 read-only 模式下仍把整个宿主文件系统只读暴露给受限 shell 子进程——bwrap 用 `--ro-bind / /`、landlock 用 `readOnly: ['/']`、seatbelt 为 allow-default（默认允许读）。即受限 bash/pwsh 仍可能读取 `~/.ssh`、`.env` 等敏感文件。详见文末「已知残留与限制」。
 
 ### QVD-2026-52644 — cordis 沙箱工具逃逸
 - 新增 `sandboxToolExec(exec)`：向外提供**白名单化**执行视图，仅含 `name` / `callId` / `arguments`（JSON clone）/ `signal`，不含 agent 或真实宿主对象。
@@ -43,11 +46,29 @@ git apply fixes.patch           rem 应用
 - `subprocess-local` 新增 `assertConfinedUnderPolicy(spec)`：受限 policy 且非 `argvConfined` → 抛错拒绝，`spawnSubprocess` 入口调用。
 - `bash-local` / `pwsh-local` 在受限 policy 下 stamp `{ sandboxPolicy, argvConfined: true }`。
 
-### QVD-2026-57410 — 未授权访问 / 伪造 Host
-- 审计结论：本树版本（`0.1.2-alpha.2`）已含上游 browser-token 会话鉴权（`packages/client/connection/src/browser-auth.ts`、`rpc-host.ts` 401/403 门禁）。伪造 Host 或缺失合法 token 的请求返回 401/403。本补丁未改动此文件。
+### QVD-2026-57410 — 未授权访问 / 伪造 Host（版本核验，非本仓库修复）
+- 审计结论：本树版本（`0.1.2-alpha.2`）已含上游 browser-token 会话鉴权（`packages/client/connection/src/browser-auth.ts`、`rpc-host.ts` 401/403 门禁）。伪造 Host 或缺失合法 token 的请求返回 401/403。本补丁**未改动**此文件，仅记录该基线中的现有鉴权实现。
 
 ## 验证方法
 
 1. 静态检测：运行本目录 `verify-dsh-fixes.bat`，五项应全部 `[PASS]`。
 2. 回归测试：`pnpm exec vitest run packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts packages/extensions/cordis-host-runner/tests/sandbox-context.spec.ts packages/boot/app-boot/tests/user-patches.spec.ts`。
 3. 全量构建：`pnpm run build`（三方：host / client / web 均通过）。
+
+## 已知残留与限制（重要）
+
+本补丁针对五个 QVD 的公开 PoC 攻击面做了闭合，但**并非对所有边界都做到全封闭**，请如实知悉：
+
+### QVD-2026-52632 的进程级读面
+
+- **已修复**：进程内 fs-sandbox 读取执行点策略校验（`checkedReadTarget` / `FS_SANDBOX_DENIED`），模型经 `tool-fs` 的 read/read_image 无法再越界读取任意路径。
+- **未覆盖（残留）**：进程级沙箱后端在 read-only 模式下仍把整个宿主文件系统只读暴露给受限 shell 子进程：
+  - bwrap（Linux）：`--ro-bind / /` 把 `/` 只读挂载进沙箱；
+  - landlock（Linux 兜底）：`readOnly: ['/']`；
+  - seatbelt（macOS）：allow-default（默认允许读，仅拒绝写）。
+- **含义**：在 read-only 会话里跑的 bash/pwsh 仍可能 `cat ~/.ssh/id_rsa`、`cat .env` 等，读取沙箱未隔离的敏感文件。这是上游披露中 52632 根因的一部分，本补丁未收窄（收窄进程级读面需对三个后端做系统目录白名单，风险较高，且无法在 Windows 本机验证 Linux/macOS 后端）。
+- **缓解**：不要依赖"只读模式"保护敏感文件；把 `.ssh`、`.env`、云凭据等移出 agent 可读目录，或在独立容器/VM 中处理不可信内容。
+
+### 更彻底的做法：升级官方修复版
+
+奇安信/安天披露中提到厂商已发布修复版本（如 v0.1.0-rc.8 及后续）。本补丁是对 `0.1.2-alpha.2` 树的补强；**若条件允许，优先升级到官方最新修复版**，并以官方 changelog 为准核对这五个 QVD 的修复状态。升级后本补丁可能不再适用（官方代码结构已变），`verify-dsh-fixes.bat` 的检测标记也可能随版本演进而需要适配。

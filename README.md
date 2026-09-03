@@ -1,6 +1,8 @@
-# DeepSeek Harness 五个 QVD 漏洞修复补丁与验证脚本
+# DeepSeek Harness QVD 安全修复补丁与验证脚本（0.1.2-alpha.2）
 
-本仓库提供 DeepSeek Harness 五个公开披露漏洞（QVD-2026-52631 / 52632 / 52644 / 52646 / 57410）的修复补丁、逐项说明，以及一个只读验证脚本。补丁基于上游 **0.1.2-alpha.2** 生成。
+本仓库提供针对 DeepSeek Harness 公开披露漏洞的**社区补丁**与验证脚本，基于上游 **0.1.2-alpha.2** 基线。其中 **4 个漏洞（52631 / 52632 / 52644 / 52646）有源码修改**；**57410 是对该基线内已有修复的版本核验，本仓库未修改它**。
+
+> 本仓库**不是官方安全更新，也不是完整安全审计**；不保证不存在其它未发现、未覆盖或与版本相关的安全问题。
 
 ## 目录内容
 
@@ -30,6 +32,7 @@
 - **成因**：`fs-sandbox` 只约束了写入，读取可越过工作区读取任意路径。
 - **影响**：受限会话读到本不该访问的文件（凭据、配置、其它项目文件）。
 - **修复**：读方法（`readText` / `streamText` / `readBytes`）在执行点按策略校验目标；越界抛结构化 `FS_SANDBOX_DENIED`；`tool-fs` 读前解析会话策略并传入，denial 经 `mapError` 映射。
+- **已知残留**：本补丁只收窄了**进程内**读取；**进程级**沙箱（bwrap `--ro-bind / /`、landlock `readOnly: ['/']`、seatbelt allow-default）仍把整个宿主只读暴露给受限 shell 子进程。即只读会话里的 bash/pwsh 仍可能读取 `~/.ssh`、`.env` 等。详见 `FIXES.md`「已知残留与限制」。
 
 ### QVD-2026-52644 — cordis 沙箱工具逃逸
 - **成因**：沙箱内自定义工具的 `execute` 拿到的执行上下文携带真实的 `agent` / `ctx` / `session` 等对象。
@@ -41,10 +44,10 @@
 - **影响**：在受限会话内执行任意系统命令。
 - **修复**：`SubprocessSpawnSpec` 增加 `sandboxPolicy` 与 `argvConfined`；受限策略未声明 `argvConfined` 即拒绝启动；`bash-local` / `pwsh-local` 在受限时 stamp `argvConfined: true`。
 
-### QVD-2026-57410 — 未授权访问 / 伪造 Host
+### QVD-2026-57410 — 未授权访问 / 伪造 Host（版本核验，非本仓库修复）
 - **成因**：历史版本缺少浏览器会话鉴权，伪造 Host 或未带凭据即可访问。
 - **影响**：未授权调用 web 接口。
-- **处理**：审计确认 0.1.2-alpha.2 已内置 browser-token 会话鉴权（launch token + 签名 cookie + 401/403 门禁），本仓库未改动该文件。
+- **处理**：审计确认 0.1.2-alpha.2 已内置 browser-token 会话鉴权（launch token + 签名 cookie + 401/403 门禁）。本仓库**未改动**该文件，仅记录该基线中的现有鉴权实现。
 
 ## 运行 verify-dsh-fixes.bat 会发生什么
 
@@ -83,6 +86,8 @@ git apply -R fixes.patch        rem 撤销（反向应用）
 - **网页/搜索内容不受信任**：对"抓取网页 / 搜索"类工具返回的内容保持警惕，它可能诱导后续危险操作。
 - **保持本地监听**：DSH Web 应只绑定 `127.0.0.1`，不要设为 `0.0.0.0` 暴露到局域网/公网。
 - **只用官方来源**：从 DeepSeek Harness 官方仓库获取与更新代码。
+- **优先升级官方修复版**：本补丁基于 0.1.2-alpha.2；官方后续版本可能已修复这五个漏洞，以官方 changelog 为准，条件允许时优先升级官方版。
+- **只读模式不保护敏感文件**：本补丁收窄了进程内读取，但进程级沙箱仍把整个宿主只读暴露给受限 shell；处理不可信内容时请把 `.ssh`、`.env`、云凭据等移出 agent 可读目录。
 - 应用补丁前先 `--check` 并在测试环境验证。
 
 ## 文件校验表（防篡改核对）
@@ -100,7 +105,7 @@ certutil -hashfile "LICENSE" SHA256
 |---|---|
 | `verify-dsh-fixes.bat` | `CC35A3D559D7E271DB55DAD5D7E1582DDA437FFD0D3B4E851DE4A379221E11CE` |
 | `fixes.patch` | `727290C97B539F4988A83803A6B4AE5E9F44F10FC1DC5D8A0981F466D3F13D0E` |
-| `FIXES.md` | `C66F861DE00AA06ECFB1107E84F012A7414698ADB408F7C18037853BDC970244` |
+| `FIXES.md` | `DF47B70B86E289133A0E5ACC6171F183012B55846D203D3ECF8D283754ECE4BA` |
 | `LICENSE` | `B546772903BAEBAFB411FD4A5E1A5B91855659BF38C56165A7096712615C8AF9` |
 
 说明：
