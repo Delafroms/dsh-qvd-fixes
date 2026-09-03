@@ -80,6 +80,14 @@ git apply -R fixes.patch        rem 撤销（反向应用）
 2. 需要回归测试或重建：`verify-dsh-fixes.bat -tests` 或 `-build`（需本机已装 `pnpm` 与依赖）。
 3. 应用修复：在基于 0.1.2-alpha.2 的检出上 `git apply --check fixes.patch` → `git apply fixes.patch`。
 
+## 本补丁不覆盖：间接提示注入
+
+间接提示注入（Indirect Prompt Injection）是**模型层面**的固有风险，**代码补丁无法消除**。腾讯朱雀实验室 14,560 次受控实测（2026-08）显示，DSH 在基线配置下对这类攻击的防御仍在早期阶段（完全成功约 5.3%）：网页、文档、邮件、Skill、PDF 元数据、隐藏 Unicode 等不可信内容，都可能诱导模型调用敏感工具。
+
+本补丁只闭合五个 QVD 对应的代码/沙箱/鉴权漏洞，**不解决提示注入**。缓解只能靠运行习惯：外部内容一律按不可信处理、敏感操作留人审批、最小权限运行、在独立容器/VM 中处理不可信内容。
+
+参考：腾讯朱雀实验室《A.I.G 红队实测 DeepSeek Harness》https://matrix.tencent.com/zh/2026/08/20/deepseek-harness-agent-injection-risk
+
 ## 安全建议
 
 - **插件即代码**：不要加载来源不明、未经审查的插件；它们在宿主进程内执行。
@@ -105,7 +113,7 @@ certutil -hashfile "LICENSE" SHA256
 |---|---|
 | `verify-dsh-fixes.bat` | `CC35A3D559D7E271DB55DAD5D7E1582DDA437FFD0D3B4E851DE4A379221E11CE` |
 | `fixes.patch` | `727290C97B539F4988A83803A6B4AE5E9F44F10FC1DC5D8A0981F466D3F13D0E` |
-| `FIXES.md` | `DF47B70B86E289133A0E5ACC6171F183012B55846D203D3ECF8D283754ECE4BA` |
+| `FIXES.md` | `15A371BCBD1FCB60A76E38CA9D3172EE525FDEEAFEA41540C721B11B95CB90B7` |
 | `LICENSE` | `B546772903BAEBAFB411FD4A5E1A5B91855659BF38C56165A7096712615C8AF9` |
 
 说明：
