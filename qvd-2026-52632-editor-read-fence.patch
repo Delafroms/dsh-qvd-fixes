@@ -1,0 +1,68 @@
+diff --git a/packages/fs/tool-str-replace-editor/src/index.ts b/packages/fs/tool-str-replace-editor/src/index.ts
+index f777366..afd6606 100644
+--- a/packages/fs/tool-str-replace-editor/src/index.ts
++++ b/packages/fs/tool-str-replace-editor/src/index.ts
+@@ -216,6 +216,7 @@ async function listDirectory(
+ 
+ async function viewPath(
+   ctx: Context,
++  policy: MutationPolicy,
+   path: string,
+   viewRange: number[] | undefined,
+   maxOutputChars: number,
+@@ -232,7 +233,17 @@ async function viewPath(
+   if (info.type !== 'file') {
+     throw new FsError(`cannot view "${target.displayPath}": not a regular file or directory`, 'FS_NOT_REGULAR_FILE')
+   }
+-  const content = await ctx.fs.readText(target, exec.signal)
++  // QVD-2026-52632: a view is a content read, so it resolves the session's
++  // sandbox policy exactly like the mutation paths do. Without this the editor
++  // could read host secrets outside the workspace that every other
++  // model-facing file tool already refuses.
++  const sandboxPolicy = policy.resolve(exec)
++  let content: string
++  try {
++    content = await ctx.fs.readText(target, exec.signal, sandboxPolicy)
++  } catch (error: unknown) {
++    throw policy.mapError(error, sandboxPolicy)
++  }
+   ctx.emit('fs/observed', target, { kind: 'present', version: info.version }, exec)
+   return formatFileView(target.displayPath, content, maxOutputChars, viewRange)
+ }
+@@ -292,7 +303,12 @@ async function replaceInFile(
+   if (info.type !== 'file') {
+     throw new FsError(`cannot edit "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+   }
+-  const before = await ctx.fs.readText(target, exec.signal)
++  let before: string
++  try {
++    before = await ctx.fs.readText(target, exec.signal, sandboxPolicy)
++  } catch (error: unknown) {
++    throw policy.mapError(error, sandboxPolicy)
++  }
+   const offsets = matchOffsets(before, oldValue)
+   const offset = offsets[0]
+   if (offset === undefined) {
+@@ -343,7 +359,12 @@ async function insertInFile(
+   if (info.type !== 'file') {
+     throw new FsError(`cannot insert into "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+   }
+-  const before = await ctx.fs.readText(target, exec.signal)
++  let before: string
++  try {
++    before = await ctx.fs.readText(target, exec.signal, sandboxPolicy)
++  } catch (error: unknown) {
++    throw policy.mapError(error, sandboxPolicy)
++  }
+   const lines = before.split('\n')
+   if (!Number.isInteger(insertLine) || insertLine < 0 || insertLine > lines.length) {
+     throw new Error(
+@@ -471,7 +492,7 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
+     async execute(args, exec) {
+       switch (args.command) {
+         case 'view':
+-          return viewPath(ctx, args.path, args.view_range ?? undefined, config.maxOutputChars, exec)
++          return viewPath(ctx, policy, args.path, args.view_range ?? undefined, config.maxOutputChars, exec)
+         case 'create':
+           return createFile(ctx, policy, args.path, args.file_text ?? undefined, exec)
+         case 'str_replace':

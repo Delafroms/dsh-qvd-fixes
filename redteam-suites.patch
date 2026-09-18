@@ -1,0 +1,410 @@
+diff --git a/packages/core/agent-loop/tests/redteam-loop-termination.spec.ts b/packages/core/agent-loop/tests/redteam-loop-termination.spec.ts
+new file mode 100644
+index 0000000..78b3c19
+--- /dev/null
++++ b/packages/core/agent-loop/tests/redteam-loop-termination.spec.ts
+@@ -0,0 +1,94 @@
++/**
++ * Agent-loop termination probe. Answers one question with evidence: when the
++ * model keeps returning plain text with NO tool calls, does the loop terminate
++ * after the first step, or keep requesting?
++ *
++ * This is the Model/Harness separation the loop investigation requires: the
++ * scripted adapter IS the raw model output, and `adapter.requests.length` is
++ * the harness's own behaviour.
++ */
++
++import { describe, expect, it } from 'vitest'
++import { Context } from '@deepseek-ai/cordis'
++import type { Agent } from '@deepseek-ai/dsh-agent'
++import AgentRegistry from '@deepseek-ai/dsh-agent'
++import AgentLoop from '@deepseek-ai/dsh-agent-loop'
++import LlmRuntime, { createUserMessage } from '@deepseek-ai/dsh-llm'
++import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
++import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
++import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
++import ToolRuntime from '@deepseek-ai/dsh-tools'
++import { MockAdapter, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
++
++/** Boot a loop over a scripted adapter, the way loop.spec does. */
++async function harness(adapter: MockAdapter): Promise<Context> {
++  const ctx = new Context()
++  await ctx.plugin(LlmRuntime)
++  await ctx.plugin(SessionStore)
++  await ctx.plugin(SessionProjectionRegistry)
++  await ctx.plugin(SystemPrompt, { personaPrefix: 'probe' })
++  await ctx.plugin(ToolRuntime)
++  await ctx.plugin(AgentRegistry)
++  await ctx.plugin(AgentLoop, { agents: [] })
++  ctx.llm.registerAdapter(['mock'], adapter)
++  return ctx
++}
++
++/** Wait for the agent's next transition to idle after a waking send. */
++function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
++  return new Promise((resolve) => {
++    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
++      if (subject === agent && status === 'idle') {
++        dispose()
++        resolve()
++      }
++    })
++  })
++}
++
++/** Run one prompt through a scripted adapter and report requests plus assistant texts. */
++async function run(script: ConstructorParameters<typeof MockAdapter>[0]): Promise<{
++  requests: number
++  texts: string[]
++}> {
++  const adapter = new MockAdapter(script)
++  const ctx = await harness(adapter)
++  const agent = await ctx.agentLoop.create(SessionId('probe'), { provider: 'mock', model: 'mock' })
++  const idle = waitForIdle(ctx, agent)
++  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
++  await idle
++  const texts = agent.session.snapshotEvents()
++    .filter(event => event.type === 'assistant/message')
++    .map(event => (event.data as { message: { content: { type: string; text?: string }[] } }).message.content
++      .filter(block => block.type === 'text').map(block => block.text ?? '').join(''))
++  return { requests: adapter.requests.length, texts }
++}
++
++describe('agent loop termination — plain text with no tool calls', () => {
++  it('terminates after ONE request when the model returns plain text', async () => {
++    const result = await run([textResponse('好。')])
++    expect(result.requests).toBe(1)
++    expect(result.texts).toEqual(['好。'])
++  })
++
++  it('terminates after one request even when the text looks like an instruction', async () => {
++    const result = await run([textResponse('执行。')])
++    expect(result.requests).toBe(1)
++  })
++
++  it('does not request again after a plain-text finish', async () => {
++    // The script has exactly one entry: a second request would throw, so a
++    // clean result with requests === 1 proves the loop stopped on its own.
++    const result = await run([textResponse('好。')])
++    expect(result.requests).toBe(1)
++  })
++
++  it('loops only when the model actually emits tool calls', async () => {
++    const result = await run([
++      toolCallResponse('c1', 'probe_echo', { value: 'a' }),
++      toolCallResponse('c2', 'probe_echo', { value: 'b' }),
++      textResponse('done'),
++    ])
++    expect(result.requests).toBe(3)
++  })
++})
+diff --git a/packages/fs/fs-sandbox/tests/redteam-read-fence.spec.ts b/packages/fs/fs-sandbox/tests/redteam-read-fence.spec.ts
+new file mode 100644
+index 0000000..6b3ed8b
+--- /dev/null
++++ b/packages/fs/fs-sandbox/tests/redteam-read-fence.spec.ts
+@@ -0,0 +1,215 @@
++/**
++ * Adversarial suite for the read fence (QVD-2026-52632). Each case attempts to
++ * reach a canary OUTSIDE the workspace through a policy-carrying read; the
++ * canary is a real file in a sibling temp directory and nothing here touches
++ * anything outside the test tree.
++ *
++ * Link primitives are platform-gated by what an UNPRIVILEGED local attacker can
++ * actually create:
++ *   - POSIX: `symlink` freely.
++ *   - Windows: `symlink` needs elevation or Developer Mode, so an unprivileged
++ *     attacker uses a directory JUNCTION (no privilege) or a file HARDLINK
++ *     (no privilege). Both are exercised here.
++ *
++ * Cases the fence cannot refuse are recorded as CURRENT behavior with the
++ * reason, never asserted away.
++ */
++
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { link, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
++import { join } from 'node:path'
++import { Context } from '@deepseek-ai/cordis'
++import type { FsTarget } from '@deepseek-ai/dsh-fs'
++import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
++import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
++import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
++import { SandboxedFileSystem } from '@deepseek-ai/dsh-fs-sandbox'
++import { assertWorkspaceOutsideTemp, outsideTempWorkspaceParent } from '../../../../scripts/snapshot-workspace-parent.ts'
++
++const IS_WINDOWS = process.platform === 'win32'
++const CANARY = 'CANARY-8f3a2b-do-not-exfiltrate'
++
++let base: string
++let workspace: string
++let outside: string
++let canary: string
++let ctx: Context
++let fs: SandboxedFileSystem
++let fiber: Awaited<ReturnType<Context['plugin']>>
++/** The policy the current deployment mode resolves to; the fence reads this. */
++let currentPolicy: { mode: SandboxMode; workspaceRoot: string }
++
++async function boot(mode: SandboxMode): Promise<void> {
++  ctx = new Context()
++  await ctx.plugin(SessionProjectionRegistry)
++  await ctx.plugin(SandboxPolicyService, { mode, workspaceRoot: workspace })
++  fiber = await ctx.plugin(SandboxedFileSystem, { cwd: workspace })
++  fs = ctx.fs as SandboxedFileSystem
++  currentPolicy = { mode, workspaceRoot: workspace }
++}
++
++beforeEach(async ({ onTestFinished }) => {
++  const directory = await mkdtemp(join(outsideTempWorkspaceParent(), '.dsh-redteam-'))
++  onTestFinished(async () => { await rm(directory, { recursive: true, force: true }) })
++  base = directory
++  assertWorkspaceOutsideTemp(base)
++  workspace = join(base, 'ws')
++  outside = join(base, 'out')
++  await mkdir(workspace)
++  await mkdir(outside)
++  canary = join(outside, 'canary.txt')
++  await writeFile(canary, CANARY)
++})
++afterEach(async () => {
++  await fiber?.dispose()
++})
++
++/** Read through the fence with the session policy, and report the outcome. */
++async function attempt(path: string): Promise<{ denied: boolean; content?: string; other?: string }> {
++  try {
++    const target: FsTarget = await fs.resolve(path)
++    const content = await fs.readText(target, undefined, currentPolicy)
++    return { denied: false, content }
++  } catch (error: unknown) {
++    const code = (error as { code?: string }).code
++    if (code === 'FS_SANDBOX_DENIED') return { denied: true }
++    return { denied: false, other: `${code ?? ''} ${(error as Error).message}` }
++  }
++}
++
++/**
++ * Create a directory link inside the workspace pointing at `outside`, using the
++ * strongest primitive an unprivileged attacker has on this platform.
++ * @param name - link name inside the workspace.
++ * @returns the link path.
++ */
++async function linkDirectory(name: string): Promise<string> {
++  const path = join(workspace, name)
++  if (IS_WINDOWS) {
++    // A junction needs no privilege; `symlink(…, 'junction')` maps to it.
++    await symlink(outside, path, 'junction')
++  } else {
++    await symlink(outside, path)
++  }
++  return path
++}
++
++describe('red team — read fence containment (canary outside workspace)', () => {
++  beforeEach(async () => { await boot('read-only') })
++
++  it('baseline: the plain absolute path is denied', async () => {
++    const result = await attempt(canary)
++    expect(result.denied).toBe(true)
++    expect(result.content).toBeUndefined()
++  })
++
++  it.each([
++    ['dot-dot traversal', () => join(workspace, '..', 'out', 'canary.txt')],
++    ['repeated separators', () => `${workspace}${'/'.repeat(3)}..${'/'.repeat(3)}out${'/'.repeat(3)}canary.txt`],
++    ['trailing dot segment', () => join(workspace, '..', 'out', '.', 'canary.txt')],
++    ['mixed dot-dot and dot', () => join(workspace, '.', '..', '.', 'out', 'canary.txt')],
++    ['dot-dot beyond root then back', () => join(workspace, '..', 'out', '..', 'out', 'canary.txt')],
++    ['backslash-separated traversal', () => `${workspace}\\..\\out\\canary.txt`],
++  ])('refuses %s', async (_label, build) => {
++    const result = await attempt(build())
++    expect(result.denied).toBe(true)
++  })
++
++  it('refuses a directory link inside the workspace pointing at the outside directory', async () => {
++    const linkPath = await linkDirectory('outlink')
++    const result = await attempt(join(linkPath, 'canary.txt'))
++    expect(result.denied).toBe(true)
++    expect(result.content).toBeUndefined()
++  })
++
++  it('refuses a link chain that hops through the workspace', async () => {
++    const first = await linkDirectory('hop')
++    const second = join(workspace, 'hop2')
++    if (IS_WINDOWS) await symlink(first, second, 'junction')
++    else await symlink(first, second)
++    const result = await attempt(join(second, 'canary.txt'))
++    expect(result.denied).toBe(true)
++  })
++
++  it('refuses the outside directory reached by its link then a dot-dot back into the workspace', async () => {
++    const linkPath = await linkDirectory('outlink')
++    const result = await attempt(join(linkPath, '..', 'out', 'canary.txt'))
++    expect(result.content).toBeUndefined()
++  })
++
++  it('KNOWN BYPASS: a hardlinked canary inside the workspace IS readable', async () => {
++    // Real, reproducible bypass — recorded as such, never asserted secure.
++    //
++    // A hardlink is the same inode under a second name. The workspace path is
++    // lexically inside, so a path-based fence cannot see the escape: the read
++    // succeeds and the canary content comes back. Exploiting it requires the
++    // attacker to already be able to CREATE a hardlink inside the workspace
++    // (i.e. an existing write primitive there), which is why it is a
++    // limitation rather than a standalone hole — but it is a real boundary.
++    const hard = join(workspace, 'hard.txt')
++    try {
++      await link(canary, hard)
++    } catch {
++      return // filesystem refused the hardlink; nothing to test here
++    }
++    const result = await attempt(hard)
++    expect({ denied: result.denied, leaked: result.content === CANARY }).toEqual({
++      denied: false,
++      leaked: true,
++    })
++  })
++
++  it('the canary content never appears in any denied outcome', async () => {
++    const linkPath = await linkDirectory('outlink')
++    const probes = [
++      canary,
++      join(workspace, '..', 'out', 'canary.txt'),
++      join(linkPath, 'canary.txt'),
++    ]
++    for (const probe of probes) {
++      const result = await attempt(probe)
++      expect(result.denied).toBe(true)
++      expect(JSON.stringify(result)).not.toContain(CANARY)
++    }
++  })
++})
++
++describe('red team — workspace-write keeps the same read containment', () => {
++  beforeEach(async () => { await boot('workspace-write') })
++
++  it('still refuses the out-of-workspace canary', async () => {
++    const result = await attempt(canary)
++    expect(result.denied).toBe(true)
++  })
++
++  it('still refuses the linked-directory route', async () => {
++    const linkPath = await linkDirectory('outlink')
++    const result = await attempt(join(linkPath, 'canary.txt'))
++    expect(result.denied).toBe(true)
++  })
++})
++
++describe('red team — documented gaps (CURRENT behavior, not claimed secure)', () => {
++  beforeEach(async () => { await boot('read-only') })
++
++  it('a read with NO policy passes through — the host contract, not a plugin path', async () => {
++    // The fence cannot distinguish "host reading its own state" from "caller
++    // passing no policy" at this layer. The plugin-facing fence lives in
++    // cordis-host-runner (qvd-2026-52632-plugin-fs-fence).
++    const target = await fs.resolve(canary)
++    const content = await fs.readText(target, undefined)
++    expect(content).toBe(CANARY)
++  })
++
++  it('danger-full-access is unfenced by design', async () => {
++    await fiber.dispose()
++    await boot('danger-full-access')
++    const result = await attempt(canary)
++    // Report the actual outcome so a wrong assumption fails loudly with evidence.
++    expect({ denied: result.denied, other: result.other, content: result.content }).toEqual({
++      denied: false,
++      other: undefined,
++      content: CANARY,
++    })
++  })
++})
+diff --git a/packages/subprocess/subprocess-local/tests/redteam-confined-spawn.spec.ts b/packages/subprocess/subprocess-local/tests/redteam-confined-spawn.spec.ts
+new file mode 100644
+index 0000000..5ebeecb
+--- /dev/null
++++ b/packages/subprocess/subprocess-local/tests/redteam-confined-spawn.spec.ts
+@@ -0,0 +1,83 @@
++/**
++ * Adversarial suite for the confined-spawn guard (QVD-2026-52646).
++ *
++ * The guard's contract: a spawn declaring a restrictive policy must carry
++ * `argvConfined: true`, so sandbox constraints cannot silently evaporate at the
++ * execution point. These cases attack that decision directly — the shapes an
++ * attacker or a careless caller would use to get an unconfined child under a
++ * restrictive policy.
++ *
++ * No process is started here: the guard is a pure predicate, so the suite is
++ * side-effect free by construction.
++ */
++
++import { describe, expect, it } from 'vitest'
++import { assertConfinedUnderPolicy } from '../src/spawn.ts'
++import type { SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
++
++/** A minimal spec carrying only the fields the guard reads. */
++function spec(overrides: Partial<SubprocessSpawnSpec>): SubprocessSpawnSpec {
++  return { argv: ['prog'], graceMs: 1000, ...overrides } as SubprocessSpawnSpec
++}
++
++describe('red team — confined-spawn guard', () => {
++  it('refuses read-only without argvConfined', () => {
++    expect(() => assertConfinedUnderPolicy(spec({ sandboxPolicy: { mode: 'read-only' } })))
++      .toThrow(/refusing an unconfined spawn/)
++  })
++
++  it('refuses workspace-write without argvConfined', () => {
++    expect(() => assertConfinedUnderPolicy(spec({ sandboxPolicy: { mode: 'workspace-write' } })))
++      .toThrow(/refusing an unconfined spawn/)
++  })
++
++  it('allows danger-full-access without argvConfined (unrestricted by definition)', () => {
++    expect(() => assertConfinedUnderPolicy(spec({ sandboxPolicy: { mode: 'danger-full-access' } })))
++      .not.toThrow()
++  })
++
++  it('allows no policy at all (host-owned spawn)', () => {
++    expect(() => assertConfinedUnderPolicy(spec({}))).not.toThrow()
++  })
++
++  it('allows a properly confined restrictive spawn', () => {
++    expect(() => assertConfinedUnderPolicy(spec({
++      sandboxPolicy: { mode: 'read-only' },
++      argvConfined: true,
++    }))).not.toThrow()
++  })
++
++  it.each([
++    ['argvConfined omitted', undefined],
++    ['argvConfined false', false],
++    ['argvConfined 0', 0],
++    ['argvConfined empty string', ''],
++    ['argvConfined null', null],
++  ])('refuses a restrictive policy with %s (no truthy coercion shortcut)', (_label, value) => {
++    // The guard must demand the literal `true`, so a caller cannot satisfy it
++    // with any other truthy-ish value.
++    expect(() => assertConfinedUnderPolicy(spec({
++      sandboxPolicy: { mode: 'read-only' },
++      argvConfined: value as boolean | undefined,
++    }))).toThrow(/refusing an unconfined spawn/)
++  })
++
++  it('refuses an unknown mode string rather than treating it as unrestricted', () => {
++    // A future/typo mode must fail closed: only the literal
++    // `danger-full-access` is exempt.
++    expect(() => assertConfinedUnderPolicy(spec({
++      sandboxPolicy: { mode: 'readonly' } as never,
++    }))).toThrow(/refusing an unconfined spawn/)
++  })
++
++  it('refuses a policy present but mode undefined', () => {
++    expect(() => assertConfinedUnderPolicy(spec({
++      sandboxPolicy: {} as never,
++    }))).toThrow(/refusing an unconfined spawn/)
++  })
++
++  it('names the offending mode in the refusal so the caller can fix it', () => {
++    expect(() => assertConfinedUnderPolicy(spec({ sandboxPolicy: { mode: 'workspace-write' } })))
++      .toThrow(/workspace-write/)
++  })
++})

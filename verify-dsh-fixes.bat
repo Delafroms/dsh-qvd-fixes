@@ -3,11 +3,12 @@ chcp 65001 >nul
 setlocal EnableDelayedExpansion
 rem ============================================================
 rem  verify-dsh-fixes.bat
-rem  ä¸€é”®éªŒè¯ DeepSeek Harness äº”ä¸ª QVD æ¼æ´žä¿®å¤æ˜¯å¦ç”Ÿæ•ˆ
-rem  ï¼ˆé™æ€æ£€æµ‹æºç ä¿®å¤æ ‡è®°ï¼Œå¯é€‰å›žå½’æµ‹è¯•ä¸Žé‡å»ºï¼‰
+rem  Ò»¼üÑéÖ¤ DeepSeek Harness Îå¸ö QVD Â©¶´ÐÞ¸´ÊÇ·ñÉúÐ§
+rem  £¨¾²Ì¬¼ì²âÔ´ÂëÐÞ¸´±ê¼Ç£¬¿ÉÑ¡»Ø¹é²âÊÔÓëÖØ½¨£©
 rem ============================================================
 
 set "FAIL=0"
+set "SKIPPED=0"
 set "MODE_TESTS="
 set "MODE_BUILD="
 
@@ -20,113 +21,137 @@ for %%a in (%*) do (
     if /I "%%~a"=="-help"   goto :usage
 )
 
-rem ---------- å®šä½ä»“åº“æ ¹ ----------
+rem ---------- ¶¨Î»²Ö¿â¸ù ----------
 set "ROOT=%~dp0"
 if exist "%ROOT%\package.json" goto :root_ok
+rem ÑÓ³ÙÕ¹¿ª£¨!VAR!£©ÊÇ±ØÐëµÄ£ºif ¿éÔÚ½âÎöÊ±¾ÍÕ¹¿ªÁË %ROOT%£¬»áÈÃÕâÀïµÄ¼ì²é
+rem ²éµÄÊÇ½Å±¾×ÔÉíÄ¿Â¼¶ø²»ÊÇ DSH_REPO£¬´Ó¶øÓÀÔ¶Ê§°Ü¡£
 if defined DSH_REPO (
-    set "ROOT=%DSH_REPO%"
-    if exist "%ROOT%\package.json" goto :root_ok
+    set "ROOT=!DSH_REPO!"
+    if exist "!ROOT!\package.json" goto :root_ok
 )
-rem æœ¬æœºå›žé€€è·¯å¾„ï¼ˆè¯¥æœºå™¨ä¸Šçš„ DSH æ£€å‡ºï¼‰
-set "ROOT=D:\deepseek-harness-master\deepseek-harness-master\deepseek-harness"
-if exist "%ROOT%\package.json" goto :root_ok
+rem DSH_REPO Î´ÉèÖÃÊ±£¬ÏòÉÏÁ½¼¶ÕÒ¼ì³ö£¨½Å±¾³£±»·ÅÔÚ¼ì³ö¸ù»ò¹¤¾ßÄ¿Â¼£©
+for %%D in ("%~dp0.." "%~dp0..\..") do (
+    if exist "%%~fD\package.json" (
+        set "ROOT=%%~fD"
+        goto :root_ok
+    )
+)
 echo.
-echo  [é”™è¯¯] æœªæ‰¾åˆ° DeepSeek Harness æ£€å‡ºæ ¹ç›®å½•ã€‚
-echo         ç”¨æ³•ï¼šæŠŠæœ¬è„šæœ¬æ”¾åˆ° DSH æ£€å‡ºæ ¹ç›®å½•å†è¿è¡Œï¼›
-echo         æˆ–åœ¨è¿è¡Œå‰è®¾ç½®çŽ¯å¢ƒå˜é‡ï¼šset DSH_REPO=ä½ çš„æ£€å‡ºè·¯å¾„
+echo  [´íÎó] Î´ÕÒµ½ DeepSeek Harness ¼ì³ö¸ùÄ¿Â¼¡£
+echo         ÓÃ·¨£º°Ñ±¾½Å±¾·Åµ½ DSH ¼ì³ö¸ùÄ¿Â¼ÔÙÔËÐÐ£»
+echo         »òÔÚÔËÐÐÇ°ÉèÖÃ»·¾³±äÁ¿£ºset DSH_REPO=ÄãµÄ¼ì³öÂ·¾¶
 exit /b 2
 
 :root_ok
 if not "%ROOT%"=="" if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 echo.
 echo ============================================================
-echo   QVD ä¿®å¤éªŒè¯å™¨ - DeepSeek Harness
-echo   ä»“åº“æ ¹: %ROOT%
+echo   QVD ÐÞ¸´ÑéÖ¤Æ÷ - DeepSeek Harness
+echo   ²Ö¿â¸ù: %ROOT%
 echo ============================================================
 echo.
 
-rem ---------- QVD-2026-52631 loader JS æ³¨å…¥ -> node:vm éš”ç¦»æ±‚å€¼ ----------
-call :CHECK "QVD-2026-52631  vm éš”ç¦»æ±‚å€¼ - createContext/runInContext" "%ROOT%\vendor\loader\src\config\utils.ts" "node:vm" "createContext" "runInContext"
-call :CHECK "QVD-2026-52631  process ç™½åå• - ä»…æš´éœ² node:url" "%ROOT%\vendor\loader\src\config\utils.ts" "getBuiltinModule" "node:url" ""
+rem ---------- QVD-2026-52631 loader JS ×¢Èë -> node:vm ¸ôÀëÇóÖµ ----------
+call :CHECK "QVD-2026-52631  vm ¸ôÀëÇóÖµ - createContext/runInContext" "%ROOT%\vendor\loader\src\config\utils.ts" "node:vm" "createContext" "runInContext"
+call :CHECK "QVD-2026-52631  process °×Ãûµ¥ - ½ö±©Â¶ node:url" "%ROOT%\vendor\loader\src\config\utils.ts" "getBuiltinModule" "node:url" ""
 
-rem ---------- QVD-2026-52632 fs-sandbox è¯»é€ƒé€¸ -> è¯»è·¯å¾„ç­–ç•¥æ ¡éªŒ ----------
-call :CHECK "QVD-2026-52632  fs-sandbox è¶Šç•Œè¯» / ç­–ç•¥æ ¡éªŒ" "%ROOT%\packages\fs\fs-sandbox\src\index.ts" "checkedReadTarget" "FS_SANDBOX_DENIED" ""
-call :CHECK "QVD-2026-52632  tool-fs è¯»å–ä¼ å…¥ç­–ç•¥å¹¶æ˜ å°„æ‹’ç»" "%ROOT%\packages\fs\tool-fs\src\read.ts" "sandboxPolicy" "mapError" ""
+rem ---------- QVD-2026-52632 fs-sandbox ¶ÁÌÓÒÝ -> ¶ÁÂ·¾¶²ßÂÔÐ£Ñé ----------
+call :CHECK "QVD-2026-52632  fs-sandbox Ô½½ç¶Á / ²ßÂÔÐ£Ñé" "%ROOT%\packages\fs\fs-sandbox\src\index.ts" "checkedReadTarget" "FS_SANDBOX_DENIED" ""
+call :CHECK "QVD-2026-52632  tool-fs ¶ÁÈ¡´«Èë²ßÂÔ²¢Ó³Éä¾Ü¾ø" "%ROOT%\packages\fs\tool-fs\src\read.ts" "sandboxPolicy" "mapError" ""
 
-rem ---------- QVD-2026-52644 cordis å·¥å…·é€ƒé€¸ -> ç™½åå•æ‰§è¡Œè§†å›¾ ----------
-call :CHECK "QVD-2026-52644  cordis æ²™ç®±å·¥å…·é€ƒé€¸ / ç™½åå• exec" "%ROOT%\packages\extensions\cordis-host-runner\src\guard.ts" "sandboxToolExec" "sandboxDefineTool" "cloneJson"
+rem ---------- QVD-2026-52644 cordis ¹¤¾ßÌÓÒÝ -> °×Ãûµ¥Ö´ÐÐÊÓÍ¼ ----------
+call :CHECK "QVD-2026-52644  cordis É³Ïä¹¤¾ßÌÓÒÝ / °×Ãûµ¥ exec" "%ROOT%\packages\extensions\cordis-host-runner\src\guard.ts" "sandboxToolExec" "sandboxDefineTool" "cloneJson"
 
-rem ---------- QVD-2026-52646 bash/pwsh å­è¿›ç¨‹é€ƒé€¸ -> argvConfined ----------
-call :CHECK "QVD-2026-52646  å­è¿›ç¨‹å—é™ç­–ç•¥å£°æ˜Ž - subprocess types" "%ROOT%\packages\subprocess\subprocess\src\types.ts" "argvConfined" "" ""
-call :CHECK "QVD-2026-52646  å­è¿›ç¨‹æ‰§è¡Œç‚¹å¼ºåˆ¶æ ¡éªŒ - spawn" "%ROOT%\packages\subprocess\subprocess-local\src\spawn.ts" "assertConfinedUnderPolicy" "" ""
-call :CHECK "QVD-2026-52646  bash-local å—é™ç­–ç•¥ stamped argvConfined" "%ROOT%\packages\shell\bash-local\src\index.ts" "argvConfined: true" "" ""
-call :CHECK "QVD-2026-52646  pwsh-local å—é™ç­–ç•¥ stamped argvConfined" "%ROOT%\packages\shell\pwsh-local\src\index.ts" "argvConfined: true" "" ""
+rem ---------- QVD-2026-52646 bash/pwsh ×Ó½ø³ÌÌÓÒÝ -> argvConfined ----------
+call :CHECK "QVD-2026-52646  ×Ó½ø³ÌÊÜÏÞ²ßÂÔÉùÃ÷ - subprocess types" "%ROOT%\packages\subprocess\subprocess\src\types.ts" "argvConfined" "" ""
+call :CHECK "QVD-2026-52646  ×Ó½ø³ÌÖ´ÐÐµãÇ¿ÖÆÐ£Ñé - spawn" "%ROOT%\packages\subprocess\subprocess-local\src\spawn.ts" "assertConfinedUnderPolicy" "" ""
+call :CHECK "QVD-2026-52646  bash-local ÊÜÏÞ²ßÂÔ stamped argvConfined" "%ROOT%\packages\shell\bash-local\src\index.ts" "argvConfined: true" "" ""
+call :CHECK "QVD-2026-52646  pwsh-local ÊÜÏÞ²ßÂÔ stamped argvConfined" "%ROOT%\packages\shell\pwsh-local\src\index.ts" "argvConfined: true" "" ""
 
-rem ---------- QVD-2026-57410 æœªæŽˆæƒè®¿é—® -> å†…å»º browser-token é‰´æƒï¼ˆå®¡è®¡ç¡®è®¤ï¼‰----------
-call :CHECK "QVD-2026-57410  browser-token ä¼šè¯é‰´æƒ - å®¡è®¡ç¡®è®¤" "%ROOT%\packages\client\connection\src\browser-auth.ts" "launchToken" "401" "timingSafeEqual"
-call :CHECK "QVD-2026-57410  API è¯·æ±‚ä¿¡ä»»é—¨ç¦ 401/403 - å®¡è®¡ç¡®è®¤" "%ROOT%\packages\client\connection\src\rpc-host.ts" "isTrustedApiRequest" "403" "401"
+rem ---------- QVD-2026-57410 Î´ÊÚÈ¨·ÃÎÊ -> ÄÚ½¨ browser-token ¼øÈ¨£¨Éó¼ÆÈ·ÈÏ£©----------
+call :CHECK "QVD-2026-57410  browser-token »á»°¼øÈ¨ - Éó¼ÆÈ·ÈÏ" "%ROOT%\packages\client\connection\src\browser-auth.ts" "launchToken" "401" "timingSafeEqual"
+call :CHECK "QVD-2026-57410  API ÇëÇóÐÅÈÎÃÅ½û 401/403 - Éó¼ÆÈ·ÈÏ" "%ROOT%\packages\client\connection\src\rpc-host.ts" "isTrustedApiRequest" "403" "401"
+
+rem ---------- ²¹³ä²¹¶¡£¨0.1.5-rc.2 Åú´Î£¬¿ÉÑ¡£©----------
+rem ÕâÐ©±ê¼ÇÖ»ÔÚÓ¦ÓÃÁË¶ÔÓ¦²¹³ä²¹¶¡µÄÊ÷ÉÏ³öÏÖ¡£È±Ê§¼ÇÎª [SKIP] ¶ø·Ç [FAIL]£¬
+rem ÒòÎª²¹³ä²¹¶¡ÊÇ¿ÉÑ¡ÔöÁ¿£ºÎ´Ó¦ÓÃËüÃÇ²»´ú±í»ùÏß²¹¶¡ÓÐÎÊÌâ¡£
+call :CHECK_OPT "²¹³ä 57410  ´«ÊäÎ§À¸ - peer µØÖ·ÅÐ¾Ý" "%ROOT%\packages\client\connection\src\api-request-trust.ts" "isLoopbackAddress" "trustedProxies" ""
+call :CHECK_OPT "²¹³ä 57410  token ½»»»µÄ peer Ð£Ñé" "%ROOT%\packages\client\connection\src\browser-auth.ts" "peerMayCarryAuthority" "" ""
+call :CHECK_OPT "²¹³ä 52632  ±à¼­Æ÷¶ÁÕ¤À¸ - view ´ø²ßÂÔ" "%ROOT%\packages\fs\tool-str-replace-editor\src\index.ts" "policy.resolve(exec)" "" ""
+call :CHECK_OPT "²¹³ä 52632  ²å¼þ fs Î§À¸ - ÃÅÃæ×¢Èë²ßÂÔ" "%ROOT%\packages\extensions\cordis-host-runner\src\guard.ts" "fencedFsService" "FENCED_FS_READS" ""
+call :CHECK_OPT "²¹³ä 52646  ÊÜÏÞ spawn fail-closed" "%ROOT%\packages\subprocess\subprocess-local\src\spawn.ts" "sandboxPolicy === undefined" "danger-full-access" ""
+
+rem ---------- ºì¶Ó²âÊÔÊÇ·ñ¾ÍÎ»£¨¿ÉÑ¡£©----------
+call :CHECK_OPT "ºì¶Ó 52632  ¶ÁÕ¤À¸¶Ô¿¹Ì×¼þ" "%ROOT%\packages\fs\fs-sandbox\tests\redteam-read-fence.spec.ts" "KNOWN BYPASS" "CANARY" ""
+call :CHECK_OPT "ºì¶Ó 52646  ÊÜÏÞ spawn ¶Ô¿¹Ì×¼þ" "%ROOT%\packages\subprocess\subprocess-local\tests\redteam-confined-spawn.spec.ts" "assertConfinedUnderPolicy" "" ""
+call :CHECK_OPT "ºì¶Ó AgentLoop  ÖÕÖ¹ÐÔÌ½²âÌ×¼þ" "%ROOT%\packages\core\agent-loop\tests\redteam-loop-termination.spec.ts" "terminates after ONE request" "" ""
+call :CHECK_OPT "²¹³ä ÊØÎÀ  ´¿ÎÄ±¾ÖØ¸´¼ì²â°ü" "%ROOT%\packages\guard\repeat-text-reminder\src\index.ts" "repeat-text-reminder" "minChars" ""
 
 echo.
 echo ------------------------------------------------------------
 if "%FAIL%"=="0" (
-    echo   [ç»“æžœ] å…¨éƒ¨ PASSï¼šäº”ä¸ª QVD çš„ä¿®å¤ç‚¹å‡å·²å°±ä½ã€‚
+    echo   [½á¹û] »ùÏß PASS£ºÎå¸ö QVD µÄÐÞ¸´µã¾ùÒÑ¾ÍÎ»¡£
 ) else (
-    echo   [ç»“æžœ] !FAIL! é¡¹ FAILï¼šä»“åº“å¯èƒ½åŸºäºŽæœªä¿®å¤ç‰ˆæœ¬ï¼Œæˆ–æ–‡ä»¶è·¯å¾„å·²å˜åŠ¨ã€‚
+    echo   [½á¹û] !FAIL! Ïî FAIL£º²Ö¿â¿ÉÄÜ»ùÓÚÎ´ÐÞ¸´°æ±¾£¬»òÎÄ¼þÂ·¾¶ÒÑ±ä¶¯¡£
+)
+if not "%SKIPPED%"=="0" (
+    echo   [ËµÃ÷] !SKIPPED! Ïî SKIP£º¿ÉÑ¡²¹³ä²¹¶¡Î´Ó¦ÓÃ£¨²»Ó°Ïì»ùÏß½áÂÛ£©¡£
 )
 echo ------------------------------------------------------------
 echo.
 
 if not "%FAIL%"=="0" exit /b 1
 
-rem ---------- å¯é€‰ï¼šå›žå½’æµ‹è¯• ----------
+rem ---------- ¿ÉÑ¡£º»Ø¹é²âÊÔ ----------
 if defined MODE_TESTS (
-    set /p "go=æ˜¯å¦è¿è¡Œ 3 ç»„å›žå½’æµ‹è¯•ï¼ˆfs-sandbox / sandbox-context / user-patchesï¼‰ï¼Ÿ[Y/N] "
+    set /p "go=ÊÇ·ñÔËÐÐ 3 ×é»Ø¹é²âÊÔ£¨fs-sandbox / sandbox-context / user-patches£©£¿[Y/N] "
     if /I "!go!"=="Y" (
         echo.
-        echo === è¿è¡Œå›žå½’æµ‹è¯• ===
+        echo === ÔËÐÐ»Ø¹é²âÊÔ ===
         cd /d "%ROOT%"
         pnpm exec vitest run "packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts" "packages/extensions/cordis-host-runner/tests/sandbox-context.spec.ts" "packages/boot/app-boot/tests/user-patches.spec.ts"
         echo.
-        echo æµ‹è¯•é€€å‡ºç : !errorlevel!ï¼ˆ0 = å…¨éƒ¨é€šè¿‡ï¼‰
+        echo ²âÊÔÍË³öÂë: !errorlevel!£¨0 = È«²¿Í¨¹ý£©
     ) else (
-        echo å·²è·³è¿‡å›žå½’æµ‹è¯•ã€‚
+        echo ÒÑÌø¹ý»Ø¹é²âÊÔ¡£
     )
 )
 
-rem ---------- å¯é€‰ï¼šå…¨é‡é‡å»º ----------
+rem ---------- ¿ÉÑ¡£ºÈ«Á¿ÖØ½¨ ----------
 if defined MODE_BUILD (
-    set /p "go2=æ˜¯å¦è¿è¡Œ pnpm run build å…¨é‡é‡å»ºï¼ˆè€—æ—¶è¾ƒé•¿ï¼‰ï¼Ÿ[Y/N] "
+    set /p "go2=ÊÇ·ñÔËÐÐ pnpm run build È«Á¿ÖØ½¨£¨ºÄÊ±½Ï³¤£©£¿[Y/N] "
     if /I "!go2!"=="Y" (
         echo.
-        echo === å¼€å§‹å…¨é‡é‡å»º ===
+        echo === ¿ªÊ¼È«Á¿ÖØ½¨ ===
         cd /d "%ROOT%"
         pnpm run build
         echo.
-        echo æž„å»ºé€€å‡ºç : !errorlevel!ï¼ˆ0 = æˆåŠŸï¼‰
+        echo ¹¹½¨ÍË³öÂë: !errorlevel!£¨0 = ³É¹¦£©
     ) else (
-        echo å·²è·³è¿‡é‡å»ºã€‚
+        echo ÒÑÌø¹ýÖØ½¨¡£
     )
 )
 
 echo.
-echo éªŒè¯å®Œæˆã€‚é€€å‡ºç  0 è¡¨ç¤ºé™æ€éªŒè¯å…¨éƒ¨é€šè¿‡ã€‚
+echo ÑéÖ¤Íê³É¡£ÍË³öÂë 0 ±íÊ¾¾²Ì¬ÑéÖ¤È«²¿Í¨¹ý¡£
 exit /b 0
 
 :usage
 echo.
-echo ç”¨æ³•: verify-dsh-fixes.bat [é€‰é¡¹]
+echo ÓÃ·¨: verify-dsh-fixes.bat [Ñ¡Ïî]
 echo.
-echo   ä¸å¸¦å‚æ•°  : ä»…é™æ€éªŒè¯äº”ä¸ª QVD ä¿®å¤ç‚¹ï¼ˆé»˜è®¤ï¼‰
-echo   -tests    : é™æ€éªŒè¯é€šè¿‡åŽï¼Œè¯¢é—®æ˜¯å¦è¿è¡Œ 3 ç»„å›žå½’æµ‹è¯•
-echo   -build    : é™æ€éªŒè¯é€šè¿‡åŽï¼Œè¯¢é—®æ˜¯å¦è¿è¡Œå…¨é‡é‡å»º
-echo   -all      : ä»¥ä¸Šä¸¤è€…éƒ½è¦
-echo   -h / -help: æ˜¾ç¤ºæœ¬å¸®åŠ©
+echo   ²»´ø²ÎÊý  : ½ö¾²Ì¬ÑéÖ¤Îå¸ö QVD ÐÞ¸´µã£¨Ä¬ÈÏ£©
+echo   -tests    : ¾²Ì¬ÑéÖ¤Í¨¹ýºó£¬Ñ¯ÎÊÊÇ·ñÔËÐÐ 3 ×é»Ø¹é²âÊÔ
+echo   -build    : ¾²Ì¬ÑéÖ¤Í¨¹ýºó£¬Ñ¯ÎÊÊÇ·ñÔËÐÐÈ«Á¿ÖØ½¨
+echo   -all      : ÒÔÉÏÁ½Õß¶¼Òª
+echo   -h / -help: ÏÔÊ¾±¾°ïÖú
 echo.
-echo çŽ¯å¢ƒå˜é‡ DSH_REPO å¯æŒ‡å®šä»“åº“æ ¹ç›®å½•ï¼ˆä¸è®¾ç½®æ—¶è‡ªåŠ¨æŽ¢æµ‹æœ¬æœºè·¯å¾„ï¼‰ã€‚
+echo »·¾³±äÁ¿ DSH_REPO ¿ÉÖ¸¶¨²Ö¿â¸ùÄ¿Â¼£¨²»ÉèÖÃÊ±×Ô¶¯Ì½²â±¾»úÂ·¾¶£©¡£
 exit /b 0
 
 :CHECK
-rem å­ç¨‹åºï¼š%1 æ˜¾ç¤ºå  %2 æ–‡ä»¶  %3/%4/%5 éœ€åŒæ—¶å­˜åœ¨çš„æ ‡è®°ï¼ˆå¯ç©ºï¼‰
+rem ×Ó³ÌÐò£º%1 ÏÔÊ¾Ãû  %2 ÎÄ¼þ  %3/%4/%5 ÐèÍ¬Ê±´æÔÚµÄ±ê¼Ç£¨¿É¿Õ£©
 set "C_LBL=%~1"
 set "C_FILE=%~2"
 set "ok=1"
@@ -139,5 +164,22 @@ if "%ok%"=="1" (
 ) else (
     echo   [FAIL] %C_LBL%
     set /a FAIL+=1
+)
+exit /b
+
+:CHECK_OPT
+rem Í¬ :CHECK£¬µ«È±Ê§¼ÇÎª [SKIP]£¨¿ÉÑ¡²¹³ä²¹¶¡Î´Ó¦ÓÃ£©£¬²»¼ÆÈë FAIL¡£
+set "C_LBL=%~1"
+set "C_FILE=%~2"
+set "ok=1"
+if not exist "%C_FILE%" set "ok=0"
+if "%ok%"=="1" if not "%~3"=="" findstr /C:"%~3" "%C_FILE%" >nul 2>nul || set "ok=0"
+if "%ok%"=="1" if not "%~4"=="" findstr /C:"%~4" "%C_FILE%" >nul 2>nul || set "ok=0"
+if "%ok%"=="1" if not "%~5"=="" findstr /C:"%~5" "%C_FILE%" >nul 2>nul || set "ok=0"
+if "%ok%"=="1" (
+    echo   [PASS] %C_LBL%
+) else (
+    echo   [SKIP] %C_LBL%
+    set /a SKIPPED+=1
 )
 exit /b
