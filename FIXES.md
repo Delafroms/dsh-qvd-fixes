@@ -2,7 +2,11 @@
 
 > 定位：本补丁是**针对 0.1.2-alpha.2 的社区补丁**——4 个漏洞（52631 / 52632 / 52644 / 52646）有源码修改；57410 为该基线内已有修复的版本核验，未做改动。非官方安全更新，也非完整安全审计。
 >
-> **另有针对 0.1.5-rc.2 的补充补丁**（`qvd-2026-57410-transport-fence.patch`、`qvd-2026-52632-editor-read-fence.patch`、`qvd-2026-52632-plugin-fs-fence.patch`），见文末[「0.1.5-rc.2 补充补丁」](#015-rc2-补充补丁2026-09-18)。
+> **另有针对 0.1.5-rc.2 的补充补丁**（`qvd-2026-57410-transport-fence.patch`、`qvd-2026-52632-editor-read-fence.patch`、`qvd-2026-52632-plugin-fs-fence.patch`、`qvd-2026-52646-confined-spawn-fail-closed.patch`、`guard-repeat-text-reminder.patch`），见文末[「0.1.5-rc.2 补充补丁」](#015-rc2-补充补丁2026-09-18)。
+>
+> **⚠️ 两组补丁目标版本不同，不能互相替代，也不能合并。**
+> `fixes.patch` 相对 **0.1.2-alpha.2** 生成；补充补丁针对 **0.1.5-rc.2**。把 0.1.5 的内容并进 `fixes.patch` 会让它在 0.1.2 上应用不了。
+> 在 0.1.5-rc.2 上必须**按序应用：基线 → 补充补丁**。原因是基线里的 `assertConfinedUnderPolicy` 是**带 fail-open 缺陷的旧版本**（`mode !== undefined` 前置条件让 `sandboxPolicy: {}` 静默放行），补充补丁 4 才会把它覆盖为 fail-closed。
 
 本清单与 `fixes.patch` 配套：`fixes.patch` 是相对 DeepSeek Harness **0.1.2-alpha.2**（修复前基线）的统一 diff，可对任意基于该版本的检出执行：
 
@@ -154,6 +158,9 @@ git apply fixes.patch           rem 应用
 | `macOS_DSH_LPE` | **不适用** | Apple 系统组件漏洞，与 DSH 仅缩写同名 |
 
 ## 补充补丁 4：`qvd-2026-52646-confined-spawn-fail-closed.patch`
+
+> **⚠️ 这个补丁会覆盖基线写入的同一函数。**
+> `fixes.patch` 里的 `assertConfinedUnderPolicy` 就是下面这个**带 fail-open 缺陷的旧版本**。在 0.1.5-rc.2 上**只应用基线会装上一个有缺陷的守卫**，必须叠加本补丁才是 fail-closed 版本。应用顺序：**基线 → 本补丁**。
 
 **来源**：红队测试发现，不是审计推测。
 
