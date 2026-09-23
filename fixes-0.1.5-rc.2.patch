@@ -1,0 +1,3062 @@
+diff --git a/packages/bundle/base/cordis.patch.yml b/packages/bundle/base/cordis.patch.yml
+index f906ea8..724d917 100644
+--- a/packages/bundle/base/cordis.patch.yml
++++ b/packages/bundle/base/cordis.patch.yml
+@@ -422,6 +422,18 @@
+         thresholds: [3, 5, 8]
+         argumentsPreviewChars: 500
+ 
++    # Consecutive-repeat reminders on the assistant TEXT chain. The tool guard
++    # above only observes calls that reach `tools/post-execute`, so a model that
++    # repeats its narration without a tool call is not covered there. Detection
++    # is structural (normalized text compared across consecutive steps), never a
++    # phrase list, and `minChars` keeps ordinary short acknowledgements out.
++    - id: repeat-text-reminder
++      name: '@deepseek-ai/dsh-repeat-text-reminder'
++      config:
++        thresholds: [3, 5, 8]
++        minChars: 8
++        textPreviewChars: 200
++
+     # The shared base enables the stable model-facing web_search and web_fetch
+     # tools. The Web app disables this host row and composes both tools per agent
+     # preset; products with a stricter network policy override tool-web. DeepSeek
+diff --git a/packages/bundle/base/package.json b/packages/bundle/base/package.json
+index abe58f9..1727f72 100644
+--- a/packages/bundle/base/package.json
++++ b/packages/bundle/base/package.json
+@@ -65,6 +65,7 @@
+     "@deepseek-ai/dsh-plan-mode": "workspace:^",
+     "@deepseek-ai/dsh-pwsh-sandbox": "workspace:^",
+     "@deepseek-ai/dsh-repeat-tool-reminder": "workspace:^",
++    "@deepseek-ai/dsh-repeat-text-reminder": "workspace:^",
+     "@deepseek-ai/dsh-sandbox-local": "workspace:^",
+     "@deepseek-ai/dsh-sandbox-policy": "workspace:^",
+     "@deepseek-ai/dsh-session": "workspace:^",
+diff --git a/packages/bundle/web-app/cordis.patch.yml b/packages/bundle/web-app/cordis.patch.yml
+index cf46030..b6b4d74 100644
+--- a/packages/bundle/web-app/cordis.patch.yml
++++ b/packages/bundle/web-app/cordis.patch.yml
+@@ -115,6 +115,11 @@
+     - id: settings-controller
+       name: '@deepseek-ai/dsh-api-settings-controller'
+ 
++    # User-owned writing controls: sampling scalars and an editable persona,
++    # applied to every conversation request through the agent/request waterfall.
++    - id: writing-control
++      name: '@deepseek-ai/dsh-writing-control'
++
+     # Workspace commands and reconnect-safe projection over Typert Remote.
+     - id: workspace-controller
+       name: '@deepseek-ai/dsh-api-workspace-controller'
+@@ -345,6 +350,11 @@
+     - id: ui-user-questions
+       name: '@deepseek-ai/dsh-client-ui-user-questions'
+ 
++    # Writing controls: the settings plugin card plus the frame-wide top-right
++    # drawer, both editing the `writing-control` settings namespace.
++    - id: ui-writing-control
++      name: '@deepseek-ai/dsh-client-ui-writing-control'
++
+     - id: ui-trajectory
+       name: '@deepseek-ai/dsh-client-ui-trajectory'
+ 
+diff --git a/packages/bundle/web-app/package.json b/packages/bundle/web-app/package.json
+index 3498cb6..e6438f6 100644
+--- a/packages/bundle/web-app/package.json
++++ b/packages/bundle/web-app/package.json
+@@ -41,6 +41,7 @@
+   "dependencies": {
+     "@deepseek-ai/dsh-agent-presets": "workspace:^",
+     "@deepseek-ai/dsh-api-remotes": "workspace:^",
++    "@deepseek-ai/dsh-writing-control": "workspace:^",
+     "@deepseek-ai/dsh-api-session-controller": "workspace:^",
+     "@deepseek-ai/dsh-api-settings-controller": "workspace:^",
+     "@deepseek-ai/dsh-api-workspace-controller": "workspace:^",
+@@ -91,6 +92,7 @@
+     "@deepseek-ai/dsh-client-ui-tool": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-trajectory": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-user-questions": "workspace:^",
++    "@deepseek-ai/dsh-client-ui-writing-control": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-workflow-run": "workspace:^",
+     "@deepseek-ai/dsh-client-ui-workspace": "workspace:^",
+     "@deepseek-ai/dsh-cmdline": "workspace:^",
+diff --git a/packages/client/connection/src/api-request-trust.ts b/packages/client/connection/src/api-request-trust.ts
+index 1065dfe..494c3ef 100644
+--- a/packages/client/connection/src/api-request-trust.ts
++++ b/packages/client/connection/src/api-request-trust.ts
+@@ -13,7 +13,7 @@
+  * belongs to the webserver config, and this fence is not an auth layer.
+  */
+ 
+-import { isLoopbackHostname } from './loopback-hostname.ts'
++import { isLoopbackAddress, isLoopbackHostname } from './loopback-hostname.ts'
+ import type { ConnectionTrustRequest } from './rpc.ts'
+ 
+ function header(headers: ConnectionTrustRequest['headers'], name: string): string | undefined {
+@@ -84,11 +84,16 @@ function isTrustedAuthority(hostUrl: URL, trustedHosts: readonly string[]): bool
+ 
+ /**
+  * Decide whether one /api request may reach the RPC bridge.
+- * @param request - Node HTTP or Fetch request facts (headers).
++ * @param request - Node HTTP or Fetch request facts: headers, plus the accepted socket's peer address when the carrier exposes one.
+  * @param trustedHosts - non-loopback authorities this deployment serves: exact `host:port`, or port-less `host` matching any port.
+- * @returns true when the Host is ours (loopback or trusted) and any attached browser markers are same-origin.
++ * @param trustedProxies - peer addresses of reverse proxies allowed to terminate the connection on loopback's behalf.
++ * @returns true when the Host is ours (loopback or trusted), a loopback Host did not arrive over a remote socket, and any attached browser markers are same-origin.
+  */
+-export function isTrustedApiRequest(request: ConnectionTrustRequest, trustedHosts: readonly string[]): boolean {
++export function isTrustedApiRequest(
++  request: ConnectionTrustRequest,
++  trustedHosts: readonly string[],
++  trustedProxies: readonly string[] = [],
++): boolean {
+   // Host fence (DNS-rebinding defense), applied to every request: the browser
+   // fills Host from the URL it believes it is talking to, so a rebound page
+   // carries the attacker's domain here even though the socket lands on this
+@@ -101,6 +106,17 @@ export function isTrustedApiRequest(request: ConnectionTrustRequest, trustedHost
+   const hostUrl = parseAuthority(host)
+   if (hostUrl === undefined) return false
+   if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, trustedHosts)) return false
++  // Transport fence (QVD-2026-57410): Host is client-controlled, so a request
++  // whose Host names loopback while the accepted socket belongs to a
++  // non-loopback peer is a forged header, not a local caller. A declared
++  // `trustedProxies` entry is the one peer allowed to speak for loopback.
++  const peer = request.socket?.remoteAddress ?? undefined
++  if (peer !== undefined
++    && isLoopbackHostname(hostUrl.hostname)
++    && !isLoopbackAddress(peer)
++    && !trustedProxies.includes(peer)) {
++    return false
++  }
+   // Cross-site fence: modern browsers label the initiator relationship on
+   // every fetch; an explicit cross-site marker is refused regardless of Origin.
+   if (header(request.headers, 'sec-fetch-site') === 'cross-site') return false
+diff --git a/packages/client/connection/src/browser-auth.ts b/packages/client/connection/src/browser-auth.ts
+index 10353d9..bcfd238 100644
+--- a/packages/client/connection/src/browser-auth.ts
++++ b/packages/client/connection/src/browser-auth.ts
+@@ -2,6 +2,7 @@
+ 
+ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+ import { credentialKey } from '@deepseek-ai/dsh-credentials'
++import { isLoopbackAddress, isLoopbackHostname } from './loopback-hostname.ts'
+ import type { CredentialProvider, CredentialRecord } from '@deepseek-ai/dsh-credentials'
+ import type {
+   ConnectionIndexRequest,
+@@ -190,6 +191,7 @@ export class BrowserAuth {
+     processOwner: object,
+     private readonly secret: Buffer,
+     maxAgeDays: number,
++    private readonly trustedProxies: readonly string[] = [],
+   ) {
+     this.launchToken = processLaunchToken(processOwner)
+     this.maxAgeMilliseconds = maxAgeDays * DAY_MILLISECONDS
+@@ -205,14 +207,16 @@ export class BrowserAuth {
+    * @param processOwner - root application context retaining one token across Connection reloads.
+    * @param credentials - persistent credential provider for the Web profile.
+    * @param maxAgeDays - positive absolute browser-cookie lifetime in days.
++   * @param trustedProxies - peer addresses allowed to speak for loopback (reverse proxies).
+    * @returns initialized authentication owner with the process owner's launch token.
+    */
+   static async create(
+     processOwner: object,
+     credentials: CredentialProvider,
+     maxAgeDays: number,
++    trustedProxies: readonly string[] = [],
+   ): Promise<BrowserAuth> {
+-    return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays)
++    return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays, trustedProxies)
+   }
+ 
+   /**
+@@ -244,7 +248,8 @@ export class BrowserAuth {
+     if (tokens.length > 0) {
+       const authority = requestAuthority(req.headers)
+       if (req.method === 'GET' && url.pathname === '/' && tokens.length === 1
+-        && authority !== undefined && tokenMatches(tokens.join(''), this.launchToken)) {
++        && authority !== undefined && tokenMatches(tokens.join(''), this.launchToken)
++        && this.peerMayCarryAuthority(authority, req)) {
+         const issuedAt = Date.now()
+         const expiresAt = issuedAt + this.maxAgeMilliseconds
+         const value = encodeCookie({
+@@ -281,6 +286,29 @@ export class BrowserAuth {
+     return false
+   }
+ 
++  /**
++   * Whether the accepted socket may present this authority. A loopback
++   * authority is credible only from a loopback peer or a declared reverse
++   * proxy: a remote client that learned the launch token would otherwise
++   * exchange it for a browser cookie by writing `Host: 127.0.0.1`
++   * (QVD-2026-57410).
++   * @param authority - normalized Host authority of the index request.
++   * @param request - the index request, carrying the accepted socket.
++   * @returns true when the peer is allowed to carry that authority.
++   */
++  private peerMayCarryAuthority(authority: string, request: ConnectionIndexRequest): boolean {
++    const peer = request.socket?.remoteAddress
++    if (peer === undefined) return true
++    let hostname: string
++    try {
++      hostname = new URL(`http://${authority}`).hostname
++    } catch {
++      return false
++    }
++    if (!isLoopbackHostname(hostname)) return true
++    return isLoopbackAddress(peer) || this.trustedProxies.includes(peer)
++  }
++
+   /**
+    * Verify the authority-bound browser cookie on a Host request.
+    * @param request - request headers carrying Host and Cookie.
+diff --git a/packages/client/connection/src/index.ts b/packages/client/connection/src/index.ts
+index 98a4354..8258c0b 100644
+--- a/packages/client/connection/src/index.ts
++++ b/packages/client/connection/src/index.ts
+@@ -81,6 +81,16 @@ export interface ConnectionConfig {
+    * bind. An entry that is not a bare, canonical authority fails plugin load.
+    */
+   trustedHosts?: string[]
++  /**
++   * Peer addresses of reverse proxies allowed to terminate the connection on
++   * loopback's behalf. Without an entry here, a request whose accepted socket
++   * is not loopback is refused whenever its Host names loopback, so a forged
++   * `Host: 127.0.0.1` from a remote client can never satisfy the fence
++   * (QVD-2026-57410). Entries are IP literals exactly as
++   * `net.Socket.remoteAddress` reports them (`10.0.0.5`, `::1`,
++   * `::ffff:10.0.0.5`).
++   */
++  trustedProxies?: string[]
+   /** Absolute browser-session lifetime in days. Default: 30. */
+   cookieMaxAgeDays?: number
+   /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
+@@ -90,6 +100,7 @@ export interface ConnectionConfig {
+ export const Config: z<ConnectionConfig> = z.object({
+   recovery: ConnectionRecoveryConfigSchema.default({}),
+   trustedHosts: z.array(String).default([]),
++  trustedProxies: z.array(String).default([]),
+   cookieMaxAgeDays: z.natural().min(1).default(30),
+   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
+ })
+@@ -105,6 +116,7 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
+   const recovery = resolveConnectionConfig(config?.recovery)
+   // The Loader resolves schema defaults; hand-built test contexts may pass none.
+   const trustedHosts = config?.trustedHosts ?? []
++  const trustedProxies = config?.trustedProxies ?? []
+   const cookieMaxAgeDays = config?.cookieMaxAgeDays ?? 30
+   const maxRequestBodyBytes = config?.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES
+   // Config boundary: a malformed entry fails the load loudly here rather than
+@@ -114,7 +126,8 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
+   const connection = new HostConnectionService(
+     ctx,
+     trustedHosts,
+-    await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
++    await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays, trustedProxies),
++    trustedProxies,
+   )
+   ctx.inject(['webServer'], (webCtx) => {
+     assertImageBodyCapacity(webCtx, maxRequestBodyBytes)
+diff --git a/packages/client/connection/src/loopback-hostname.ts b/packages/client/connection/src/loopback-hostname.ts
+index fe2fe93..00f9795 100644
+--- a/packages/client/connection/src/loopback-hostname.ts
++++ b/packages/client/connection/src/loopback-hostname.ts
+@@ -16,3 +16,16 @@ export function isLoopbackHostname(hostname: string): boolean {
+     && parts[0] === '127'
+     && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+ }
++
++/**
++ * Whether one accepted-socket peer address names the local loopback authority.
++ * `node:http` reports IPv4 as a dotted quad, IPv6 loopback as `::1`, and an
++ * IPv4-mapped peer as `::ffff:a.b.c.d`, so the mapped form is unwrapped before
++ * classification.
++ * @param address - `net.Socket.remoteAddress` verbatim.
++ * @returns true for loopback peers.
++ */
++export function isLoopbackAddress(address: string): boolean {
++  if (address === '::1') return true
++  return isLoopbackHostname(address.startsWith('::ffff:') ? address.slice(7) : address)
++}
+diff --git a/packages/client/connection/src/rpc-host.ts b/packages/client/connection/src/rpc-host.ts
+index d74734e..74bcda5 100644
+--- a/packages/client/connection/src/rpc-host.ts
++++ b/packages/client/connection/src/rpc-host.ts
+@@ -66,11 +66,13 @@ export class HostConnectionService extends Service implements HostConnectionHand
+    * @param ctx - owning Connection plugin context.
+    * @param trustedHosts - deployment authorities accepted by the Host/Origin fence.
+    * @param browserAuth - process token and persistent browser-session owner.
++   * @param trustedProxies - peer addresses allowed to speak for loopback (reverse proxies).
+    */
+   constructor(
+     ctx: Context,
+     private readonly trustedHosts: readonly string[],
+     private readonly browserAuth: BrowserAuth,
++    private readonly trustedProxies: readonly string[] = [],
+   ) {
+     super(ctx, 'connection')
+   }
+@@ -95,7 +97,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
+ 
+   /** Apply the configured Host/Origin fence, then browser authentication. */
+   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection {
+-    if (!isTrustedApiRequest(request, this.trustedHosts)) return 403
++    if (!isTrustedApiRequest(request, this.trustedHosts, this.trustedProxies)) return 403
+     return this.browserAuth.isAuthenticated(request) ? undefined : 401
+   }
+ 
+diff --git a/packages/client/connection/src/rpc.ts b/packages/client/connection/src/rpc.ts
+index 9474d72..29ec3fc 100644
+--- a/packages/client/connection/src/rpc.ts
++++ b/packages/client/connection/src/rpc.ts
+@@ -79,6 +79,15 @@ export type RpcMessage = ClientRequest | ServerResponse
+ export interface ConnectionTrustRequest {
+   /** Request headers supplied by either the Fetch or node:http representation. */
+   readonly headers: Headers | Readonly<Record<string, string | readonly string[] | undefined>>
++  /**
++   * Accepted socket of a `node:http` request, when the carrier exposes one.
++   * Headers are client-controlled, so a Host that names loopback is
++   * trustworthy only together with the peer address this socket reports
++   * (QVD-2026-57410). A Fetch request carries no socket, which leaves the
++   * transport fence inert — correct, because in-process Fetch never crosses a
++   * network.
++   */
++  readonly socket?: { readonly remoteAddress?: string | undefined } | null | undefined
+ }
+ 
+ /** HTTP status returned before dispatch, or undefined when the request may proceed. */
+diff --git a/packages/client/connection/tests/api-request-trust.host.spec.ts b/packages/client/connection/tests/api-request-trust.host.spec.ts
+index 359a461..8472d4a 100644
+--- a/packages/client/connection/tests/api-request-trust.host.spec.ts
++++ b/packages/client/connection/tests/api-request-trust.host.spec.ts
+@@ -3,8 +3,11 @@
+ import { describe, expect, it } from 'vitest'
+ import { assertTrustedAuthority, isTrustedApiRequest } from '../src/api-request-trust.ts'
+ 
+-function request(headers: Record<string, string | undefined>): { headers: Record<string, string | undefined> } {
+-  return { headers }
++function request(
++  headers: Record<string, string | undefined>,
++  peer?: string,
++): { headers: Record<string, string | undefined>; socket?: { remoteAddress: string } } {
++  return peer === undefined ? { headers } : { headers, socket: { remoteAddress: peer } }
+ }
+ 
+ describe('isTrustedApiRequest', () => {
+@@ -58,6 +61,31 @@ describe('isTrustedApiRequest', () => {
+     expect(isTrustedApiRequest(request({ host: '127.0.0.1:3080', origin: 'null' }), [])).toBe(false)
+   })
+ 
++  it('refuses a loopback Host that arrived over a remote socket (QVD-2026-57410)', () => {
++    // Host is client-controlled: a remote client may simply write
++    // `Host: 127.0.0.1` and satisfy the Host fence alone. The accepted socket
++    // is the fact that client cannot forge.
++    expect(isTrustedApiRequest(request({ host: '127.0.0.1:3080' }, '203.0.113.5'), [])).toBe(false)
++    expect(isTrustedApiRequest(request({ host: 'localhost:3080' }, '203.0.113.5'), [])).toBe(false)
++    expect(isTrustedApiRequest(request({ host: '[::1]:3080' }, '203.0.113.5'), [])).toBe(false)
++    // The same Host from a real loopback peer stays trusted, in every spelling
++    // node:http reports.
++    expect(isTrustedApiRequest(request({ host: '127.0.0.1:3080' }, '127.0.0.1'), [])).toBe(true)
++    expect(isTrustedApiRequest(request({ host: '127.0.0.1:3080' }, '::1'), [])).toBe(true)
++    expect(isTrustedApiRequest(request({ host: '127.0.0.1:3080' }, '::ffff:127.0.0.1'), [])).toBe(true)
++    // A carrier that exposes no socket (in-process Fetch) keeps the Host fence alone.
++    expect(isTrustedApiRequest(request({ host: '127.0.0.1:3080' }), [])).toBe(true)
++  })
++
++  it('guards only a loopback Host, and admits declared reverse proxies', () => {
++    // A declared LAN authority is reached from another host by design.
++    expect(isTrustedApiRequest(request({ host: '192.168.1.5:3080' }, '192.168.1.9'), ['192.168.1.5:3080'])).toBe(true)
++    // A reverse proxy speaks for loopback only when its peer address is declared.
++    expect(isTrustedApiRequest(request({ host: '127.0.0.1:3080' }, '10.0.0.5'), [])).toBe(false)
++    expect(isTrustedApiRequest(request({ host: '127.0.0.1:3080' }, '10.0.0.5'), [], ['10.0.0.5'])).toBe(true)
++    expect(isTrustedApiRequest(request({ host: '127.0.0.1:3080' }, '10.0.0.6'), [], ['10.0.0.5'])).toBe(false)
++  })
++
+   it('accepts a same-origin browser request, with or without an Origin header', () => {
+     expect(isTrustedApiRequest(request({
+       host: 'localhost:3080',
+diff --git a/packages/core/agent-loop/src/agent.ts b/packages/core/agent-loop/src/agent.ts
+index 06e1f51..e240b08 100644
+--- a/packages/core/agent-loop/src/agent.ts
++++ b/packages/core/agent-loop/src/agent.ts
+@@ -517,6 +517,9 @@ export class ReactLoopAgent implements Agent {
+       : undefined
+     const reasoningEffort = this.options.reasoningEffort ?? persistedReasoningEffort
+     const maxTokens = this.options.maxTokens
++    const topP = this.options.topP
++    const frequencyPenalty = this.options.frequencyPenalty
++    const presencePenalty = this.options.presencePenalty
+     const seedConfig = deepFreeze(structuredClone(
+       this.requestHeaderLogged
+         // oxlint-disable-next-line typescript/no-non-null-assertion -- the instance logged the header it now folds
+@@ -525,6 +528,9 @@ export class ReactLoopAgent implements Agent {
+           ...route,
+           ...reasoningEffort === undefined ? {} : { reasoningEffort },
+           ...maxTokens === undefined ? {} : { maxTokens },
++          ...topP === undefined ? {} : { topP },
++          ...frequencyPenalty === undefined ? {} : { frequencyPenalty },
++          ...presencePenalty === undefined ? {} : { presencePenalty },
+         },
+     ))
+     const proposedConfig = await this.dispatch.waterfall(
+diff --git a/packages/core/agent-loop/src/index.ts b/packages/core/agent-loop/src/index.ts
+index aa967f8..f81f6b2 100644
+--- a/packages/core/agent-loop/src/index.ts
++++ b/packages/core/agent-loop/src/index.ts
+@@ -201,6 +201,12 @@ function assertAgentOptions(options: AgentOptions): void {
+     && (!Number.isSafeInteger(options.maxTokens) || options.maxTokens <= 0)) {
+     throw new TypeError('agent maxTokens must be a positive safe integer')
+   }
++  for (const key of ['topP', 'frequencyPenalty', 'presencePenalty'] as const) {
++    const value = options[key]
++    if (value !== undefined && (!Number.isFinite(value) || value < 0 || value > 2)) {
++      throw new TypeError(`agent ${key} must be a finite number in [0, 2]`)
++    }
++  }
+ }
+ 
+ /** One session's owned write handle plus the count of events already stored through it. */
+@@ -369,6 +375,9 @@ export class AgentLoop extends Service implements AgentFactory {
+       model: z.string(),
+       reasoningEffort: z.string().min(1) as z<ReturnType<typeof ReasoningEffortId>>,
+       maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER),
++      topP: z.number().min(0).max(1),
++      frequencyPenalty: z.number().min(-2).max(2),
++      presencePenalty: z.number().min(-2).max(2),
+       cwd: z.string(),
+       resumeSessionId: z.string(),
+     })).default([]),
+diff --git a/packages/core/agent-loop/tests/redteam-loop-termination.spec.ts b/packages/core/agent-loop/tests/redteam-loop-termination.spec.ts
+new file mode 100644
+index 0000000..78b3c19
+--- /dev/null
++++ b/packages/core/agent-loop/tests/redteam-loop-termination.spec.ts
+@@ -0,0 +1,94 @@
++/**
++ * Agent-loop termination probe. Answers one question with evidence: when the
++ * model keeps returning plain text with NO tool calls, does the loop terminate
++ * after the first step, or keep requesting?
++ *
++ * This is the Model/Harness separation the loop investigation requires: the
++ * scripted adapter IS the raw model output, and `adapter.requests.length` is
++ * the harness's own behaviour.
++ */
++
++import { describe, expect, it } from 'vitest'
++import { Context } from '@deepseek-ai/cordis'
++import type { Agent } from '@deepseek-ai/dsh-agent'
++import AgentRegistry from '@deepseek-ai/dsh-agent'
++import AgentLoop from '@deepseek-ai/dsh-agent-loop'
++import LlmRuntime, { createUserMessage } from '@deepseek-ai/dsh-llm'
++import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
++import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
++import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
++import ToolRuntime from '@deepseek-ai/dsh-tools'
++import { MockAdapter, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
++
++/** Boot a loop over a scripted adapter, the way loop.spec does. */
++async function harness(adapter: MockAdapter): Promise<Context> {
++  const ctx = new Context()
++  await ctx.plugin(LlmRuntime)
++  await ctx.plugin(SessionStore)
++  await ctx.plugin(SessionProjectionRegistry)
++  await ctx.plugin(SystemPrompt, { personaPrefix: 'probe' })
++  await ctx.plugin(ToolRuntime)
++  await ctx.plugin(AgentRegistry)
++  await ctx.plugin(AgentLoop, { agents: [] })
++  ctx.llm.registerAdapter(['mock'], adapter)
++  return ctx
++}
++
++/** Wait for the agent's next transition to idle after a waking send. */
++function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
++  return new Promise((resolve) => {
++    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
++      if (subject === agent && status === 'idle') {
++        dispose()
++        resolve()
++      }
++    })
++  })
++}
++
++/** Run one prompt through a scripted adapter and report requests plus assistant texts. */
++async function run(script: ConstructorParameters<typeof MockAdapter>[0]): Promise<{
++  requests: number
++  texts: string[]
++}> {
++  const adapter = new MockAdapter(script)
++  const ctx = await harness(adapter)
++  const agent = await ctx.agentLoop.create(SessionId('probe'), { provider: 'mock', model: 'mock' })
++  const idle = waitForIdle(ctx, agent)
++  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
++  await idle
++  const texts = agent.session.snapshotEvents()
++    .filter(event => event.type === 'assistant/message')
++    .map(event => (event.data as { message: { content: { type: string; text?: string }[] } }).message.content
++      .filter(block => block.type === 'text').map(block => block.text ?? '').join(''))
++  return { requests: adapter.requests.length, texts }
++}
++
++describe('agent loop termination — plain text with no tool calls', () => {
++  it('terminates after ONE request when the model returns plain text', async () => {
++    const result = await run([textResponse('好。')])
++    expect(result.requests).toBe(1)
++    expect(result.texts).toEqual(['好。'])
++  })
++
++  it('terminates after one request even when the text looks like an instruction', async () => {
++    const result = await run([textResponse('执行。')])
++    expect(result.requests).toBe(1)
++  })
++
++  it('does not request again after a plain-text finish', async () => {
++    // The script has exactly one entry: a second request would throw, so a
++    // clean result with requests === 1 proves the loop stopped on its own.
++    const result = await run([textResponse('好。')])
++    expect(result.requests).toBe(1)
++  })
++
++  it('loops only when the model actually emits tool calls', async () => {
++    const result = await run([
++      toolCallResponse('c1', 'probe_echo', { value: 'a' }),
++      toolCallResponse('c2', 'probe_echo', { value: 'b' }),
++      textResponse('done'),
++    ])
++    expect(result.requests).toBe(3)
++  })
++})
+diff --git a/packages/core/agent/src/runtime-types.ts b/packages/core/agent/src/runtime-types.ts
+index 31338e8..c08c71c 100644
+--- a/packages/core/agent/src/runtime-types.ts
++++ b/packages/core/agent/src/runtime-types.ts
+@@ -32,6 +32,12 @@ export interface AgentOptions {
+   reasoningEffort?: ReasoningEffortId
+   /** Maximum output tokens for each conversation-model request. */
+   maxTokens?: number
++  /** Nucleus sampling cutoff forwarded to the provider's `top_p`. */
++  topP?: number
++  /** Repetition penalty forwarded to the provider's `frequency_penalty`. */
++  frequencyPenalty?: number
++  /** Novelty penalty forwarded to the provider's `presence_penalty`. */
++  presencePenalty?: number
+ }
+ 
+ /** Options for {@link Agent.cancel}. */
+diff --git a/packages/extensions/cordis-host-runner/src/guard.ts b/packages/extensions/cordis-host-runner/src/guard.ts
+index a70e47e..fdc1835 100644
+--- a/packages/extensions/cordis-host-runner/src/guard.ts
++++ b/packages/extensions/cordis-host-runner/src/guard.ts
+@@ -20,6 +20,7 @@ import { assertSupportedJsonSchema, defineTool } from '@deepseek-ai/dsh-tools'
+ import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
+ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+ import type { JsonValue } from '@deepseek-ai/dsh-util-values'
++import type { Session } from '@deepseek-ai/dsh-session'
+ 
+ const DYNAMIC_TOOL = Symbol('cordis-host-runner.dynamic-tool')
+ const SCHEMA_TYPES = new Set<unknown>(['string', 'number', 'integer', 'boolean', 'null', 'object', 'array', 'json'])
+@@ -539,12 +540,44 @@ function assertRenderedContent(value: JsonValue): ContentBlock[] {
+   )
+ }
+ 
++/**
++ * Whitelisted execution facts a sandbox tool's `execute` receives in place of
++ * the real tool-execution context. The live `ToolExecution` handed to host
++ * tools carries `agent` (and through it the real runtime `ctx` and `session`)
++ * — a model-written function must never see those, or the vm façade's denial
++ * surface is bypassed by object graph instead of syntax. Only inert identity
++ * and JSON argument fields cross the boundary; `signal` is forwarded because
++ * cancellation is a cooperative contract the sandbox module already extends
++ * to host closures, and every other member is dropped.
++ * @param exec - the host tool-execution context (may be `undefined` for direct calls).
++ * @returns a plain view carrying at most `name`, `callId`, `arguments`, and `signal`.
++ */
++export function sandboxToolExec(exec: unknown): Record<string, unknown> | undefined {
++  if (!isPlainRecord(exec)) return undefined
++  const view: Record<string, unknown> = {}
++  for (const key of ['name', 'callId'] as const) {
++    if (typeof exec[key] === 'string') view[key] = exec[key]
++  }
++  if (exec.arguments !== undefined) {
++    try {
++      view.arguments = cloneJson(exec.arguments, 'tool execution arguments')
++    } catch {
++      // Arguments already crossed JSON validation before dispatch; a clone
++      // failure means the caller bypassed it — drop the field rather than
++      // leak the live object.
++    }
++  }
++  if (exec.signal instanceof AbortSignal) view.signal = exec.signal
++  return view
++}
++
+ /**
+  * The `harness.defineTool` handed into the sandbox: the real DSL, with `parameters` normalized
+  * into a fresh host-realm ParameterSchemaSpec (raw object wrappers unwrapped,
+  * required arrays mapped, and explicit DSL object openness enforced) and the tool's `execute` return normalized into the host realm
+  * via a JSON round-trip. Non-JSON or wrong-shape output fails that call instead of poisoning
+- * the session log.
++ * the session log. The model-written `execute` receives {@link sandboxToolExec}
++ * instead of the live tool-execution context, so `agent`/`ctx` never enter the vm realm.
+  * @param options - the standard `defineTool` options; `parameters` may be the ParameterSchemaSpec DSL or a JSON-Schema-style wrapper.
+  * @returns the marker-tagged definition `harness.registerTool` (and the guarded `ctx.tools.register`) accepts.
+  */
+@@ -580,7 +613,10 @@ export function sandboxDefineTool(options: unknown): ToolDefinition {
+       } : {},
+     },
+     async execute(args: unknown, exec: unknown): Promise<JsonValue> {
+-      return cloneJson(await rawExecute(args, exec), 'harness.defineTool execute result') as JsonValue
++      // Never forward the live exec: it carries `agent` whose `ctx` is the
++      // real runtime context. The whitelisted view keeps cancellation and the
++      // JSON arguments without exposing any host handle to vm-realm code.
++      return cloneJson(await rawExecute(args, sandboxToolExec(exec)), 'harness.defineTool execute result') as JsonValue
+     },
+   })
+   const parameters = { ...tool.parameters, ...normalized.rootAnnotations }
+@@ -697,6 +733,66 @@ function guardedService(service: object, name: string, reportFailure: (error: Er
+ }
+ /* jscpd:ignore-end */
+ 
++/**
++ * Sandbox facts one fenced read carries: the session's resolved mode and its
++ * workspace boundary. Structurally the policy the fs service accepts; declared
++ * here so this package needs no dependency on the policy package.
++ */
++interface FencedReadPolicy {
++  readonly mode: string
++  readonly workspaceRoot: string
++}
++
++/** The policy service this package reads; the deployment provides it. */
++interface SandboxPolicyLookup {
++  resolve(request: { session: Session }): FencedReadPolicy
++}
++
++/**
++ * Read methods whose content must carry the owning session's policy, mapped to
++ * the argument count each accepts before that policy (the fs service takes it
++ * last). A dynamic plugin reaching these without a policy would otherwise read
++ * host files outside its session's boundary (QVD-2026-52632).
++ */
++const FENCED_FS_READS: Readonly<Record<string, number>> = {
++  readText: 3,
++  streamText: 3,
++  readBytes: 4,
++}
++
++/**
++ * Filesystem façade for a dynamic plugin: content reads carry the policy
++ * resolved from the plugin's own session, substituted for whatever the caller
++ * passed, so a plugin cannot widen its own boundary. Every other member keeps
++ * the registration guard, so no call can return a Context.
++ * @param service - the live fs service the plugin declared.
++ * @param policy - the policy resolved from the owning session.
++ * @param reportFailure - reports a guard rejection to the owning Agent.
++ * @returns the fs service whose reads carry that policy.
++ */
++function fencedFsService(
++  service: object,
++  policy: FencedReadPolicy,
++  reportFailure: (error: Error) => void,
++): unknown {
++  const guarded = guardedService(service, 'fs', reportFailure) as object
++  return new Proxy(guarded, {
++    get(target, prop) {
++      const value = Reflect.get(target, prop) as unknown
++      if (typeof prop !== 'string' || typeof value !== 'function') return value
++      const arity = FENCED_FS_READS[prop]
++      if (arity === undefined) return value
++      return (...args: unknown[]): unknown => {
++        // Keep the declared position even when the caller omitted optional
++        // arguments, and drop anything it passed there: the policy is ours.
++        const forwarded = args.slice(0, arity - 1)
++        forwarded[arity - 1] = policy
++        return Reflect.apply(value as (...a: unknown[]) => unknown, target, forwarded)
++      }
++    },
++  })
++}
++
+ /**
+  * The service names a plugin declared in `inject`, as a lookup set. Whatever
+  * declaration style the plugin used — an `inject: ['bash', 'tools']` array or
+@@ -715,9 +811,19 @@ function declaredInjects(ctx: Context): Set<string> {
+  * tools, optional `ctx.get()` lookup, and declared-service property access.
+  * Framework plumbing is denied, and service methods cannot return a Context.
+  */
+-function sandboxContext(ctx: Context, reportFailure: (error: Error) => void): Context {
++function sandboxContext(
++  ctx: Context,
++  reportFailure: (error: Error) => void,
++  session?: Session,
++): Context {
+   const tools = sandboxTools(ctx)
+   const declared = declaredInjects(ctx)
++  // Resolve the owning session's policy once, while building the façade: the
++  // plugin never sees the resolver, so it cannot widen or replace this
++  // boundary (QVD-2026-52632).
++  const readPolicy = session === undefined
++    ? undefined
++    : (ctx.get('sandboxPolicy') as SandboxPolicyLookup | undefined)?.resolve({ session })
+   // A framework member or an undeclared service — distinguish the two so the
+   // error teaches the right fix (declare it in inject vs it is withheld).
+   const denyRead = (prop: string): never => {
+@@ -740,6 +846,7 @@ function sandboxContext(ctx: Context, reportFailure: (error: Error) => void): Co
+     if (requireDeclaration && !declared.has(name)) return denyRead(name)
+     const service = denyContext(ctx.get(name), name, reportFailure)
+     if (service === null || (typeof service !== 'object' && typeof service !== 'function')) return service
++    if (name === 'fs' && readPolicy !== undefined) return fencedFsService(service, readPolicy, reportFailure)
+     return guardedService(service, name, reportFailure)
+   }
+   const get = (name: string): unknown => readService(name, false)
+@@ -797,15 +904,20 @@ export function isPlugin(value: unknown): value is Plugin {
+  * Wrap a plugin so `apply` receives the sandbox context while preserving injection metadata.
+  * @param plugin - the plugin the host half returned.
+  * @param reportFailure - reports a guard rejection to the owning Agent.
++ * @param session - the session owning this run; its sandbox policy fences the plugin's file reads.
+  * @returns an equivalent plugin whose `apply` sees the sandbox context façade.
+  */
+-export function guardedPlugin(plugin: Plugin, reportFailure: (error: Error) => void): Plugin {
++export function guardedPlugin(
++  plugin: Plugin,
++  reportFailure: (error: Error) => void,
++  session?: Session,
++): Plugin {
+   if (typeof plugin === 'function') {
+     const functionPlugin = plugin as (ctx: Context, config?: unknown) => unknown
+     return {
+       name: pluginName(plugin),
+       apply(ctx: Context, config?: unknown) {
+-        return functionPlugin(sandboxContext(ctx, reportFailure), config)
++        return functionPlugin(sandboxContext(ctx, reportFailure, session), config)
+       },
+     }
+   }
+@@ -813,7 +925,7 @@ export function guardedPlugin(plugin: Plugin, reportFailure: (error: Error) => v
+   return {
+     ...plugin,
+     apply(ctx: Context, config?: unknown) {
+-      return objectPlugin.apply(sandboxContext(ctx, reportFailure), config)
++      return objectPlugin.apply(sandboxContext(ctx, reportFailure, session), config)
+     },
+   }
+ }
+diff --git a/packages/extensions/cordis-host-runner/src/index.ts b/packages/extensions/cordis-host-runner/src/index.ts
+index 332e36f..68d9cb1 100644
+--- a/packages/extensions/cordis-host-runner/src/index.ts
++++ b/packages/extensions/cordis-host-runner/src/index.ts
+@@ -902,10 +902,14 @@ export class DynamicCordisRunnerService extends TypertRemoteService {
+           ? 'the Host half returned `undefined` — did you forget `return`?'
+           : 'the Host half must return a Plugin function or an object with apply(ctx)')
+       }
++      // The session owning this run supplies the sandbox policy its file reads
++      // are fenced by; a dynamic plugin never chooses its own boundary.
++      const session = this.rootCtx.get('agents')?.get(plugin.sessionId)?.session
+       run.fiber = await startHostHalf(
+         this.requireGroup(),
+         evaluated,
+         (error) => { this.steerGuardFailure(plugin, run, 'Host', errorDetails(error)) },
++        session,
+       )
+       return undefined
+     } catch (error) {
+diff --git a/packages/extensions/cordis-host-runner/src/lifecycle.ts b/packages/extensions/cordis-host-runner/src/lifecycle.ts
+index 11b0832..e3d068e 100644
+--- a/packages/extensions/cordis-host-runner/src/lifecycle.ts
++++ b/packages/extensions/cordis-host-runner/src/lifecycle.ts
+@@ -9,6 +9,7 @@
+  */
+ 
+ import type { Context, Fiber, Plugin } from '@deepseek-ai/cordis'
++import type { Session } from '@deepseek-ai/dsh-session'
+ import { guardedPlugin } from './guard.ts'
+ 
+ /**
+@@ -17,15 +18,17 @@ import { guardedPlugin } from './guard.ts'
+  * @param group - the `cordis-dynamic` group fiber every host half hangs under.
+  * @param plugin - the plugin the sandbox returned; wrapped with the registration guard before starting.
+  * @param reportGuardFailure - reports post-activation Host guard rejections to the owning Agent.
++ * @param session - the session owning this run; its sandbox policy fences the plugin's file reads.
+  * @returns the settled child fiber (possibly pending on unsatisfied `inject`).
+  */
+ export async function startHostHalf(
+   group: Fiber,
+   plugin: Plugin,
+   reportGuardFailure: (error: Error) => void,
++  session?: Session,
+ ): Promise<Fiber> {
+   await group.await()
+-  const fiber = group.ctx.plugin(guardedPlugin(plugin, reportGuardFailure))
++  const fiber = group.ctx.plugin(guardedPlugin(plugin, reportGuardFailure, session))
+   try {
+     await fiber.await()
+   } catch (error) {
+diff --git a/packages/extensions/cordis-host-runner/tests/sandbox-context.spec.ts b/packages/extensions/cordis-host-runner/tests/sandbox-context.spec.ts
+index 92fc2eb..01572f9 100644
+--- a/packages/extensions/cordis-host-runner/tests/sandbox-context.spec.ts
++++ b/packages/extensions/cordis-host-runner/tests/sandbox-context.spec.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from 'vitest'
+-import { call, CONTENT_OUTPUT_CODE, dummyTool, mount, setup, text } from './helpers.ts'
++import { AGENT_A, call, CONTENT_OUTPUT_CODE, dummyTool, mount, setup, text } from './helpers.ts'
++import { sandboxDefineTool, sandboxToolExec } from '../src/guard.ts'
+ 
+ /**
+  * The sandbox context façade is a whitelist, not a pass-through proxy. A running
+@@ -140,6 +141,67 @@ describe('sandbox context façade — escape surface is closed', () => {
+   })
+ })
+ 
++describe('sandbox tool execution boundary — exec view (QVD-2026-52644)', () => {
++  it('the whitelisted view drops the live agent while keeping identity and arguments', () => {
++    const view = sandboxToolExec({
++      callId: 'call-1',
++      name: 'host_tool',
++      arguments: { file_path: 'a.txt' },
++      agent: { id: 'agent-1', ctx: { root: {} } },
++      signal: new AbortController().signal,
++    })
++    expect(view).not.toBeUndefined()
++    expect(Object.keys(view!).sort()).toEqual(['arguments', 'callId', 'name', 'signal'])
++    expect((view as Record<string, unknown>).agent).toBeUndefined()
++  })
++
++  it('a non-record or arguments-less exec yields at most the primitive identity fields', () => {
++    expect(sandboxToolExec(undefined)).toBeUndefined()
++    expect(sandboxToolExec(null)).toBeUndefined()
++    const bare = sandboxToolExec({ callId: 'call-2' })
++    expect(bare).toEqual({ callId: 'call-2' })
++  })
++
++  it('a sandbox-defined tool execute receives only the view — never exec.agent.ctx', async () => {
++    const tool = sandboxDefineTool({
++      name: 'probe_exec_view',
++      description: 'Report which execution facts reached the sandbox.',
++      parameters: {},
++      output: {
++        schema: { type: 'object', additionalProperties: false, properties: {} },
++        render() { return [{ type: 'text' as const, text: '' }] },
++      },
++      async execute(_args: unknown, exec: unknown) {
++        const record = exec !== undefined && exec !== null && typeof exec === 'object' ? exec : undefined
++        const agent = record !== undefined && 'agent' in record ? (record as { agent?: unknown }).agent : undefined
++        return {
++          received: record !== undefined,
++          keys: record === undefined ? [] : Object.keys(record).sort(),
++          agentKeys: agent !== undefined && typeof agent === 'object'
++            ? Object.keys(agent as Record<string, unknown>).sort()
++            : null,
++          ctxExposed: agent !== undefined && typeof agent === 'object' && !!(agent as { ctx?: unknown }).ctx,
++        }
++      },
++    })
++    const result = await (tool as unknown as { execute(args: unknown, exec: unknown): Promise<unknown> }).execute(
++      {},
++      {
++        callId: 'call-3',
++        name: 'host_tool',
++        arguments: {},
++        agent: { id: 'agent-1', ctx: { root: {} } },
++      },
++    ) as { received: boolean; keys: string[]; agentKeys: string[] | null; ctxExposed: boolean }
++    expect(result.received).toBe(true)
++    expect(result.keys).not.toContain('agent')
++    expect(result.keys).toContain('callId')
++    expect(result.keys).toContain('arguments')
++    expect(result.agentKeys).toBeNull()
++    expect(result.ctxExposed).toBe(false)
++  })
++})
++
+ describe('sandbox context façade — inject gate on services', () => {
+   it('denies an undeclared live service (property access), naming the inject fix', async () => {
+     // `systemPrompt` is a live global service in the setup harness, but this
+@@ -265,3 +327,62 @@ describe('sandbox tools façade — get is a read-only schema view', () => {
+     expect(text(await call(harness.ctx, 'probe_unknown', {}))).toBe('true')
+   })
+ })
++
++/**
++ * A dynamic plugin is code the model wrote at runtime, so its filesystem reads
++ * must carry the sandbox policy of the session owning the run — never a policy
++ * the plugin chose. The fs service itself stays pass-through for the host's own
++ * reads, so the fence belongs on the plugin-facing façade (QVD-2026-52632).
++ */
++describe('dynamic plugin filesystem fence — reads carry the owning session policy', () => {
++  const POLICY = { mode: 'read-only', workspaceRoot: '/ws' }
++
++  /** Mount a host half running `expr` against its injected fs, and report what the service received. */
++  async function readThrough(expr: string): Promise<unknown[][]> {
++    const harness = await setup()
++    const calls: unknown[][] = []
++    const session = { id: AGENT_A.id, header: { cwd: '/ws' } }
++    harness.ctx.provide('agents', {
++      get: (id: string) => (id === AGENT_A.id ? { ...AGENT_A, session } : undefined),
++    })
++    harness.ctx.provide('sandboxPolicy', { resolve: () => POLICY })
++    harness.ctx.provide('fs', {
++      readText: (...args: unknown[]) => { calls.push(args); return 'body' },
++      readBytes: (...args: unknown[]) => { calls.push(args); return new Uint8Array() },
++      stat: (...args: unknown[]) => { calls.push(args); return undefined },
++    })
++    await mount(harness, `
++      return {
++        name: 'reader',
++        inject: ['fs'],
++        async apply(ctx) { ${expr} },
++      }
++    `)
++    return calls
++  }
++
++  it('appends the session policy to a read that passed none', async () => {
++    const calls = await readThrough(`await ctx.fs.readText({ displayPath: '/etc/passwd' })`)
++    expect(calls).toHaveLength(1)
++    expect(calls[0]).toEqual([{ displayPath: '/etc/passwd' }, undefined, POLICY])
++  })
++
++  it('replaces a policy the plugin supplied, so it cannot widen its own boundary', async () => {
++    const calls = await readThrough(
++      `await ctx.fs.readText({ displayPath: '/etc/passwd' }, undefined, { mode: 'danger-full-access', workspaceRoot: '/' })`,
++    )
++    expect(calls[0]?.[2]).toEqual(POLICY)
++  })
++
++  it('keeps the policy last for a read whose optional arguments are all present', async () => {
++    const calls = await readThrough(
++      `await ctx.fs.readBytes({ displayPath: '/etc/passwd' }, undefined, 64)`,
++    )
++    expect(calls[0]).toEqual([{ displayPath: '/etc/passwd' }, undefined, 64, POLICY])
++  })
++
++  it('leaves a non-read member unfenced', async () => {
++    const calls = await readThrough(`await ctx.fs.stat({ displayPath: '/etc/passwd' })`)
++    expect(calls[0]).toEqual([{ displayPath: '/etc/passwd' }])
++  })
++})
+diff --git a/packages/fs/fs-sandbox/src/index.ts b/packages/fs/fs-sandbox/src/index.ts
+index 60dd6b3..72710ea 100644
+--- a/packages/fs/fs-sandbox/src/index.ts
++++ b/packages/fs/fs-sandbox/src/index.ts
+@@ -4,8 +4,15 @@
+  * text-storage mechanics — resolve, stat, read/stream, list, the atomic
+  * write and the read-match-write edit critical section — are the local
+  * implementation's, verbatim; this package adds only the per-call POLICY fence
+- * on the two mutations. Reads pass through untouched: every mode permits
+- * reading.
++ * on the two mutations AND on policy-carrying content reads. Reads used to
++ * pass through untouched ("every mode permits reading"), which let a read-only
++ * session exfiltrate `~/.ssh/*`, `.env`, and credential files
++ * (QVD-2026-52632); a caller that resolves a per-session policy (the
++ * model-facing read tools always do) is now bounded to that policy's writable
++ * roots, and an out-of-root read under `read-only`/`workspace-write` throws
++ * the structured `FS_SANDBOX_DENIED`. Reads without a policy stay
++ * host-owned and unfenced, preserving internal consumers that read managed
++ * paths outside the workspace.
+  *
+  * The fence is a policy check in TRUSTED code over a MODEL-CONTROLLED path,
+  * NOT a kernel boundary — the operations are the seam's own (open, rename),
+@@ -17,8 +24,9 @@
+  * syscall) is narrowed by re-canonicalizing immediately before delegating and
+  * is accepted for this threat model.
+  *
+- * Per-call policy: `read-only` denies every mutation; `workspace-write` allows
+- * a mutation only when the target canonicalizes under the policy's workspace
++ * Per-call policy: `read-only` denies every mutation and every out-of-root
++ * read; `workspace-write` allows a mutation or read only when the target
++ * canonicalizes under the policy's workspace
+  * root or a platform temp area from the shared `writableRoots` policy;
+  * `danger-full-access` delegates unfenced. A denial throws the structured
+  * `FS_SANDBOX_DENIED`.
+@@ -66,6 +74,98 @@ export class SandboxedFileSystem extends LocalFileSystem {
+     return this.defaultMode
+   }
+ 
++  /**
++   * Fence a content read by the per-call policy, then delegate to the
++   * inherited reader. Reads previously bypassed the policy entirely; a
++   * sandboxed mode now reads only within its writable roots, so read-only
++   * sessions can no longer exfiltrate host secrets outside the workspace.
++   * @param target - the resolved target to read.
++   * @param signal - aborts the read.
++   * @param sandboxPolicy - the per-call mode and workspace root; omit to use
++   *   the deployment fallback.
++   * @returns the text content from the inherited backend.
++   */
++  override async readText(
++    target: FsTarget,
++    signal?: AbortSignal,
++    sandboxPolicy?: SandboxExecutionPolicy,
++  ): Promise<string> {
++    return super.readText(await this.checkedReadTarget(target, sandboxPolicy), signal)
++  }
++
++  /**
++   * Fence a streaming content read like {@link readText}; see there.
++   * @param target - the resolved target to read.
++   * @param signal - aborts the stream.
++   * @param sandboxPolicy - the per-call mode and workspace root; omit to use
++   *   the deployment fallback.
++   * @returns the inherited chunk iterable.
++   */
++  override async streamText(
++    target: FsTarget,
++    signal?: AbortSignal,
++    sandboxPolicy?: SandboxExecutionPolicy,
++  ): Promise<AsyncIterable<string>> {
++    return super.streamText(await this.checkedReadTarget(target, sandboxPolicy), signal)
++  }
++
++  /**
++   * Fence a raw-byte content read like {@link readText}; see there.
++   * @param target - the resolved target to read.
++   * @param signal - aborts the read.
++   * @param maxBytes - inclusive byte cap passed to the inherited reader.
++   * @param sandboxPolicy - the per-call mode and workspace root; omit to use
++   *   the deployment fallback.
++   * @returns the inherited raw content.
++   */
++  override async readBytes(
++    target: FsTarget,
++    signal: AbortSignal | undefined,
++    maxBytes: number,
++    sandboxPolicy?: SandboxExecutionPolicy,
++  ): Promise<Uint8Array> {
++    return super.readBytes(await this.checkedReadTarget(target, sandboxPolicy), signal, maxBytes)
++  }
++
++  /**
++   * Enforce the per-call policy against a READ target and return the EXACT
++   * target the read must use, mirroring {@link checkedTarget}. A caller that
++   * passes no policy is a host-owned read and keeps the legacy pass-through
++   * (the model-facing tools always resolve a per-session policy before
++   * reading, which is the surface QVD-2026-52632 is about). Under a policy,
++   * `read-only`/`workspace-write` re-canonicalize NOW and require containment
++   * under a writable root, throwing the structured `FS_SANDBOX_DENIED` for
++   * out-of-root reads; `danger-full-access` returns the caller's target
++   * unfenced.
++   */
++  private async checkedReadTarget(target: FsTarget, sandboxPolicy?: SandboxExecutionPolicy): Promise<FsTarget> {
++    if (sandboxPolicy === undefined) return target
++    const { mode } = sandboxPolicy
++    if (mode === 'danger-full-access') return target
++    const fresh = await this.resolve(target.displayPath)
++    // read-only grants the workspace as a READ root even though its writable
++    // roots are empty (that is the point of a read-only session: process the
++    // untrusted workspace without changing it). workspace-write shares the
++    // mutation containment.
++    const roots: string[] = mode === 'read-only'
++      ? [(await this.resolve(sandboxPolicy.workspaceRoot)).targetKey]
++      : writableRoots(sandboxPolicy)
++    let contained = false
++    for (const root of roots) {
++      if (await isPathUnder(fresh.targetKey, root)) {
++        contained = true
++        break
++      }
++    }
++    if (!contained) {
++      throw new FsError(
++        `cannot read "${target.displayPath}": file access denied under ${mode} mode (read is confined to the workspace)`,
++        'FS_SANDBOX_DENIED',
++      )
++    }
++    return fresh
++  }
++
+   /**
+    * Fence the write by the per-call policy, then delegate to the inherited
+    * atomic write. See {@link checkedTarget}.
+diff --git a/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts b/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts
+index e445c47..14e82d7 100644
+--- a/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts
++++ b/packages/fs/fs-sandbox/tests/fs-sandbox.spec.ts
+@@ -86,6 +86,51 @@ describe('read-only', () => {
+     await writeFile(path, 'hello')
+     expect(await fs.readText(await target(path))).toBe('hello')
+   })
++
++  it('denies an out-of-workspace read under an explicit read-only policy (QVD-2026-52632)', async () => {
++    const inside = join(workspace, 'inside.txt')
++    const secret = join(outside, 'secret.txt')
++    await writeFile(inside, 'ok')
++    await writeFile(secret, 'top')
++    const policy = ctx.sandboxPolicy.resolve()
++    // The workspace itself stays readable — a read-only session still
++    // processes the untrusted workspace it was pointed at.
++    expect(await fs.readText(await target(inside), undefined, policy)).toBe('ok')
++    // Host secrets outside the workspace are no longer silently readable.
++    await expect(fs.readText(await target(secret), undefined, policy))
++      .rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
++  })
++})
++
++describe('read containment parity', () => {
++  it('workspace-write confines policy-carrying reads to the writable roots', async () => {
++    await boot('workspace-write')
++    const inside = join(workspace, 'inside.txt')
++    const secret = join(outside, 'secret.txt')
++    await writeFile(inside, 'ok')
++    await writeFile(secret, 'top')
++    const policy = ctx.sandboxPolicy.resolve()
++    expect(await fs.readText(await target(inside), undefined, policy)).toBe('ok')
++    await expect(fs.readText(await target(secret), undefined, policy))
++      .rejects.toMatchObject({ code: 'FS_SANDBOX_DENIED' })
++  })
++
++  it('danger-full-access policy-carrying reads pass through unfenced', async () => {
++    await boot('danger-full-access')
++    const secret = join(outside, 'secret.txt')
++    await writeFile(secret, 'top')
++    const policy = ctx.sandboxPolicy.resolve()
++    expect(await fs.readText(await target(secret), undefined, policy)).toBe('top')
++  })
++
++  it('reads without a policy remain host-owned pass-throughs (host paths are unaffected)', async () => {
++    await boot('read-only')
++    const secret = join(outside, 'secret.txt')
++    await writeFile(secret, 'top')
++    // Legacy direct-service reads (skills, sessions, LSP) resolve no policy
++    // and keep reading managed paths outside the workspace.
++    expect(await fs.readText(await target(secret))).toBe('top')
++  })
+ })
+ 
+ describe('workspace-write containment', () => {
+diff --git a/packages/fs/fs-sandbox/tests/redteam-read-fence.spec.ts b/packages/fs/fs-sandbox/tests/redteam-read-fence.spec.ts
+new file mode 100644
+index 0000000..6b3ed8b
+--- /dev/null
++++ b/packages/fs/fs-sandbox/tests/redteam-read-fence.spec.ts
+@@ -0,0 +1,215 @@
++/**
++ * Adversarial suite for the read fence (QVD-2026-52632). Each case attempts to
++ * reach a canary OUTSIDE the workspace through a policy-carrying read; the
++ * canary is a real file in a sibling temp directory and nothing here touches
++ * anything outside the test tree.
++ *
++ * Link primitives are platform-gated by what an UNPRIVILEGED local attacker can
++ * actually create:
++ *   - POSIX: `symlink` freely.
++ *   - Windows: `symlink` needs elevation or Developer Mode, so an unprivileged
++ *     attacker uses a directory JUNCTION (no privilege) or a file HARDLINK
++ *     (no privilege). Both are exercised here.
++ *
++ * Cases the fence cannot refuse are recorded as CURRENT behavior with the
++ * reason, never asserted away.
++ */
++
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { link, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
++import { join } from 'node:path'
++import { Context } from '@deepseek-ai/cordis'
++import type { FsTarget } from '@deepseek-ai/dsh-fs'
++import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
++import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
++import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
++import { SandboxedFileSystem } from '@deepseek-ai/dsh-fs-sandbox'
++import { assertWorkspaceOutsideTemp, outsideTempWorkspaceParent } from '../../../../scripts/snapshot-workspace-parent.ts'
++
++const IS_WINDOWS = process.platform === 'win32'
++const CANARY = 'CANARY-8f3a2b-do-not-exfiltrate'
++
++let base: string
++let workspace: string
++let outside: string
++let canary: string
++let ctx: Context
++let fs: SandboxedFileSystem
++let fiber: Awaited<ReturnType<Context['plugin']>>
++/** The policy the current deployment mode resolves to; the fence reads this. */
++let currentPolicy: { mode: SandboxMode; workspaceRoot: string }
++
++async function boot(mode: SandboxMode): Promise<void> {
++  ctx = new Context()
++  await ctx.plugin(SessionProjectionRegistry)
++  await ctx.plugin(SandboxPolicyService, { mode, workspaceRoot: workspace })
++  fiber = await ctx.plugin(SandboxedFileSystem, { cwd: workspace })
++  fs = ctx.fs as SandboxedFileSystem
++  currentPolicy = { mode, workspaceRoot: workspace }
++}
++
++beforeEach(async ({ onTestFinished }) => {
++  const directory = await mkdtemp(join(outsideTempWorkspaceParent(), '.dsh-redteam-'))
++  onTestFinished(async () => { await rm(directory, { recursive: true, force: true }) })
++  base = directory
++  assertWorkspaceOutsideTemp(base)
++  workspace = join(base, 'ws')
++  outside = join(base, 'out')
++  await mkdir(workspace)
++  await mkdir(outside)
++  canary = join(outside, 'canary.txt')
++  await writeFile(canary, CANARY)
++})
++afterEach(async () => {
++  await fiber?.dispose()
++})
++
++/** Read through the fence with the session policy, and report the outcome. */
++async function attempt(path: string): Promise<{ denied: boolean; content?: string; other?: string }> {
++  try {
++    const target: FsTarget = await fs.resolve(path)
++    const content = await fs.readText(target, undefined, currentPolicy)
++    return { denied: false, content }
++  } catch (error: unknown) {
++    const code = (error as { code?: string }).code
++    if (code === 'FS_SANDBOX_DENIED') return { denied: true }
++    return { denied: false, other: `${code ?? ''} ${(error as Error).message}` }
++  }
++}
++
++/**
++ * Create a directory link inside the workspace pointing at `outside`, using the
++ * strongest primitive an unprivileged attacker has on this platform.
++ * @param name - link name inside the workspace.
++ * @returns the link path.
++ */
++async function linkDirectory(name: string): Promise<string> {
++  const path = join(workspace, name)
++  if (IS_WINDOWS) {
++    // A junction needs no privilege; `symlink(…, 'junction')` maps to it.
++    await symlink(outside, path, 'junction')
++  } else {
++    await symlink(outside, path)
++  }
++  return path
++}
++
++describe('red team — read fence containment (canary outside workspace)', () => {
++  beforeEach(async () => { await boot('read-only') })
++
++  it('baseline: the plain absolute path is denied', async () => {
++    const result = await attempt(canary)
++    expect(result.denied).toBe(true)
++    expect(result.content).toBeUndefined()
++  })
++
++  it.each([
++    ['dot-dot traversal', () => join(workspace, '..', 'out', 'canary.txt')],
++    ['repeated separators', () => `${workspace}${'/'.repeat(3)}..${'/'.repeat(3)}out${'/'.repeat(3)}canary.txt`],
++    ['trailing dot segment', () => join(workspace, '..', 'out', '.', 'canary.txt')],
++    ['mixed dot-dot and dot', () => join(workspace, '.', '..', '.', 'out', 'canary.txt')],
++    ['dot-dot beyond root then back', () => join(workspace, '..', 'out', '..', 'out', 'canary.txt')],
++    ['backslash-separated traversal', () => `${workspace}\\..\\out\\canary.txt`],
++  ])('refuses %s', async (_label, build) => {
++    const result = await attempt(build())
++    expect(result.denied).toBe(true)
++  })
++
++  it('refuses a directory link inside the workspace pointing at the outside directory', async () => {
++    const linkPath = await linkDirectory('outlink')
++    const result = await attempt(join(linkPath, 'canary.txt'))
++    expect(result.denied).toBe(true)
++    expect(result.content).toBeUndefined()
++  })
++
++  it('refuses a link chain that hops through the workspace', async () => {
++    const first = await linkDirectory('hop')
++    const second = join(workspace, 'hop2')
++    if (IS_WINDOWS) await symlink(first, second, 'junction')
++    else await symlink(first, second)
++    const result = await attempt(join(second, 'canary.txt'))
++    expect(result.denied).toBe(true)
++  })
++
++  it('refuses the outside directory reached by its link then a dot-dot back into the workspace', async () => {
++    const linkPath = await linkDirectory('outlink')
++    const result = await attempt(join(linkPath, '..', 'out', 'canary.txt'))
++    expect(result.content).toBeUndefined()
++  })
++
++  it('KNOWN BYPASS: a hardlinked canary inside the workspace IS readable', async () => {
++    // Real, reproducible bypass — recorded as such, never asserted secure.
++    //
++    // A hardlink is the same inode under a second name. The workspace path is
++    // lexically inside, so a path-based fence cannot see the escape: the read
++    // succeeds and the canary content comes back. Exploiting it requires the
++    // attacker to already be able to CREATE a hardlink inside the workspace
++    // (i.e. an existing write primitive there), which is why it is a
++    // limitation rather than a standalone hole — but it is a real boundary.
++    const hard = join(workspace, 'hard.txt')
++    try {
++      await link(canary, hard)
++    } catch {
++      return // filesystem refused the hardlink; nothing to test here
++    }
++    const result = await attempt(hard)
++    expect({ denied: result.denied, leaked: result.content === CANARY }).toEqual({
++      denied: false,
++      leaked: true,
++    })
++  })
++
++  it('the canary content never appears in any denied outcome', async () => {
++    const linkPath = await linkDirectory('outlink')
++    const probes = [
++      canary,
++      join(workspace, '..', 'out', 'canary.txt'),
++      join(linkPath, 'canary.txt'),
++    ]
++    for (const probe of probes) {
++      const result = await attempt(probe)
++      expect(result.denied).toBe(true)
++      expect(JSON.stringify(result)).not.toContain(CANARY)
++    }
++  })
++})
++
++describe('red team — workspace-write keeps the same read containment', () => {
++  beforeEach(async () => { await boot('workspace-write') })
++
++  it('still refuses the out-of-workspace canary', async () => {
++    const result = await attempt(canary)
++    expect(result.denied).toBe(true)
++  })
++
++  it('still refuses the linked-directory route', async () => {
++    const linkPath = await linkDirectory('outlink')
++    const result = await attempt(join(linkPath, 'canary.txt'))
++    expect(result.denied).toBe(true)
++  })
++})
++
++describe('red team — documented gaps (CURRENT behavior, not claimed secure)', () => {
++  beforeEach(async () => { await boot('read-only') })
++
++  it('a read with NO policy passes through — the host contract, not a plugin path', async () => {
++    // The fence cannot distinguish "host reading its own state" from "caller
++    // passing no policy" at this layer. The plugin-facing fence lives in
++    // cordis-host-runner (qvd-2026-52632-plugin-fs-fence).
++    const target = await fs.resolve(canary)
++    const content = await fs.readText(target, undefined)
++    expect(content).toBe(CANARY)
++  })
++
++  it('danger-full-access is unfenced by design', async () => {
++    await fiber.dispose()
++    await boot('danger-full-access')
++    const result = await attempt(canary)
++    // Report the actual outcome so a wrong assumption fails loudly with evidence.
++    expect({ denied: result.denied, other: result.other, content: result.content }).toEqual({
++      denied: false,
++      other: undefined,
++      content: CANARY,
++    })
++  })
++})
+diff --git a/packages/fs/fs/src/index.ts b/packages/fs/fs/src/index.ts
+index bfa05bf..0d5f7a0 100644
+--- a/packages/fs/fs/src/index.ts
++++ b/packages/fs/fs/src/index.ts
+@@ -184,9 +184,12 @@ export abstract class FileSystem extends Service {
+    * Read the whole regular text file as a single decoded string.
+    * @param target - the resolved target to read.
+    * @param signal - aborts the read.
++   * @param sandboxPolicy - the per-call mode and workspace root this read runs
++   *   under; a sandboxing backend fences the read by it, the bare backend
++   *   ignores it. Omit to leave the backend its own default.
+    * @returns the full decoded UTF-8 content.
+    */
+-  abstract readText(target: FsTarget, signal?: AbortSignal): Promise<string>
++  abstract readText(target: FsTarget, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy): Promise<string>
+ 
+   /**
+    * Stream the whole regular text file as decoded text chunks (same text
+@@ -195,9 +198,12 @@ export abstract class FileSystem extends Service {
+    * touches raw bytes.
+    * @param target - the resolved target to read.
+    * @param signal - aborts the stream, including between chunks.
++   * @param sandboxPolicy - the per-call mode and workspace root this read runs
++   *   under; a sandboxing backend fences the read by it, the bare backend
++   *   ignores it. Omit to leave the backend its own default.
+    * @returns the chunk iterable, decoded and validated like {@link readText}.
+    */
+-  abstract streamText(target: FsTarget, signal?: AbortSignal): Promise<AsyncIterable<string>>
++  abstract streamText(target: FsTarget, signal?: AbortSignal, sandboxPolicy?: SandboxExecutionPolicy): Promise<AsyncIterable<string>>
+ 
+   /**
+    * Read the whole regular file as raw bytes with no decoding or binary
+@@ -207,9 +213,12 @@ export abstract class FileSystem extends Service {
+    * @param target - the resolved target to read.
+    * @param signal - aborts the read.
+    * @param maxBytes - inclusive byte cap on the complete content.
++   * @param sandboxPolicy - the per-call mode and workspace root this read runs
++   *   under; a sandboxing backend fences the read by it, the bare backend
++   *   ignores it. Omit to leave the backend its own default.
+    * @returns the full raw content, at most `maxBytes` long.
+    */
+-  abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array>
++  abstract readBytes(target: FsTarget, signal: AbortSignal | undefined, maxBytes: number, sandboxPolicy?: SandboxExecutionPolicy): Promise<Uint8Array>
+ 
+   /**
+    * Read one byte window of the regular file as raw bytes with no decoding or
+diff --git a/packages/fs/tool-fs/src/index.ts b/packages/fs/tool-fs/src/index.ts
+index cfbec13..c76247b 100644
+--- a/packages/fs/tool-fs/src/index.ts
++++ b/packages/fs/tool-fs/src/index.ts
+@@ -58,22 +58,23 @@ export function apply(ctx: Context, config: Config): void {
+   assertPositiveInteger('readMaxLineLength', resolved.readMaxLineLength)
+   assertPositiveInteger('readMaxBytes', resolved.readMaxBytes)
+   assertPositiveInteger('readStreamMinSize', resolved.readStreamMinSize)
++  // One escalation API shared by the fs tools: advertisement gating, per-call
++  // policy resolution (writes AND reads — a read-only session must not read
++  // outside its workspace, QVD-2026-52632), and denial-marker mapping, all
++  // keyed off whether the mounted ctx.fs confines (ctx.fs.sandboxMode).
++  const sandbox = new FsSandboxController(ctx)
+   applyReadTool(ctx, {
+     limit: resolved.readLimit,
+     maxLineLength: resolved.readMaxLineLength,
+     maxBytes: resolved.readMaxBytes,
+     streamMinSize: resolved.readStreamMinSize,
+-  })
++  }, sandbox)
+   // read_image is composition-conditional: without a mounted attachment store
+   // the deployment cannot durably commit image bytes, so the tool never
+   // registers; the execute body keeps a defensive re-check for direct callers.
+   ctx.inject(['attachments'], (imageCtx) => {
+-    applyReadImageTool(imageCtx)
++    applyReadImageTool(imageCtx, sandbox)
+   })
+-  // One escalation API shared by both mutating tools: advertisement gating,
+-  // per-call policy resolution, and denial-marker mapping, all keyed off whether
+-  // the mounted ctx.fs confines (ctx.fs.sandboxMode).
+-  const sandbox = new FsSandboxController(ctx)
+   applyWriteTool(ctx, sandbox)
+   applyEditTool(ctx, sandbox)
+ }
+diff --git a/packages/fs/tool-fs/src/read-image.ts b/packages/fs/tool-fs/src/read-image.ts
+index 3115473..f066c6c 100644
+--- a/packages/fs/tool-fs/src/read-image.ts
++++ b/packages/fs/tool-fs/src/read-image.ts
+@@ -20,6 +20,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
+ import type { GenericCallView, ToolExecution } from '@deepseek-ai/dsh-tools'
+ import type {} from '@deepseek-ai/dsh-fs'
+ import { resolveRegularReadTarget } from './read-target.ts'
++import type { FsEscalationArgs, FsSandboxController } from './sandbox.ts'
+ 
+ /** Extensions `read_image` accepts; magic-byte validation at the attachment service stays authoritative. */
+ const IMAGE_EXTENSIONS: Readonly<Record<string, ImageMediaType>> = {
+@@ -205,7 +206,7 @@ function imageReadContent(value: ImageReadValue): ContentBlock[] {
+  * @param ctx - the registration scope; execution uses its `fs` service plus
+  *   the optional `attachments`/`llm` services.
+  */
+-export function applyReadImageTool(ctx: Context): void {
++export function applyReadImageTool(ctx: Context, sandbox?: FsSandboxController): void {
+   ctx.tools.register(defineTool({
+     name: 'read_image',
+     description: 'Read a PNG/JPEG/WebP/GIF file and return the image itself. '
+@@ -262,7 +263,16 @@ export function applyReadImageTool(ctx: Context): void {
+       // The tool result is one message carrying one image, so the per-message
+       // aggregate bound applies beside the per-image bound.
+       const byteCap = Math.min(attachments.imageLimits.maxImageBytes, attachments.imageLimits.maxMessageImageBytes)
+-      const data = await ctx.fs.readBytes(target, exec.signal, byteCap)
++      // QVD-2026-52632: resolve the session's sandbox policy before reading so
++      // the backend confines policy-carrying reads to the workspace.
++      const sandboxPolicy = sandbox === undefined ? undefined : await sandbox.resolvePolicy('read_image', args as FsEscalationArgs, exec)
++      let data: Uint8Array
++      try {
++        data = await ctx.fs.readBytes(target, exec.signal, byteCap, sandboxPolicy)
++      } catch (error: unknown) {
++        if (sandbox !== undefined && sandboxPolicy !== undefined) throw sandbox.mapError(error, sandboxPolicy)
++        throw error
++      }
+       const mediaType = declared ?? sniffImageMediaType(data)
+       if (mediaType === undefined) {
+         throw new Error(`cannot read "${target.displayPath}": the file content is not a supported image format; read_image accepts PNG/JPEG/WebP/GIF`)
+diff --git a/packages/fs/tool-fs/src/read.ts b/packages/fs/tool-fs/src/read.ts
+index 96a3830..c77e510 100644
+--- a/packages/fs/tool-fs/src/read.ts
++++ b/packages/fs/tool-fs/src/read.ts
+@@ -10,6 +10,7 @@ import type { GenericCallView, ReadResultView, ToolResult } from '@deepseek-ai/d
+ import type {} from '@deepseek-ai/dsh-fs'
+ import { buildWindow, formatReadOutput, langFromPath, readMetaFromMeta } from './read-render.ts'
+ import { resolveRegularReadTarget } from './read-target.ts'
++import type { FsEscalationArgs, FsSandboxController } from './sandbox.ts'
+ 
+ /** Default and maximum number of lines returned by one `read` call (the `readLimit` config). */
+ export const READ_LIMIT = 2000
+@@ -65,7 +66,7 @@ export function parseReadArgs(args: { file_path: string; offset?: number; limit?
+  * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
+  * @param caps - the deployment's resolved read caps (plugin config after defaulting).
+  */
+-export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
++export function applyReadTool(ctx: Context, caps: ReadToolCaps, sandbox?: FsSandboxController): void {
+   ctx.systemPrompt.section({
+     name: 'tool:read',
+     order: ctx.systemPrompt.getSectionOrder('TOOL_READ'),
+@@ -140,28 +141,38 @@ export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
+       // A concurrent write can only make a later guarded mutation fail stale and require reread.
+       const { target, info } = await resolveRegularReadTarget(ctx, exec, input.filePath)
+ 
+-      // Stream when the file is large OR size is unknown, so a size-less backend
+-      // never buffers an arbitrarily large file.
+-      const chunks = info.size === undefined || info.size >= caps.streamMinSize
+-        ? await ctx.fs.streamText(target, exec.signal)
+-        : [await ctx.fs.readText(target, exec.signal)]
+-      const window = await buildWindow(
+-        chunks,
+-        { offset: input.offset, limit: input.limit, maxLineLength: caps.maxLineLength, maxBytes: caps.maxBytes },
+-        target.displayPath,
+-      )
++      // QVD-2026-52632: resolve the session's sandbox policy before any content
++      // read. Under a confining backend the fs service confines policy-carrying
++      // reads to the workspace; a denial is mapped to the shared [sandbox: …]
++      // marker the same way a write denial is.
++      const sandboxPolicy = sandbox === undefined ? undefined : await sandbox.resolvePolicy('read', args as FsEscalationArgs, exec)
++      try {
++        // Stream when the file is large OR size is unknown, so a size-less backend
++        // never buffers an arbitrarily large file.
++        const chunks = info.size === undefined || info.size >= caps.streamMinSize
++          ? await ctx.fs.streamText(target, exec.signal, sandboxPolicy)
++          : [await ctx.fs.readText(target, exec.signal, sandboxPolicy)]
++        const window = await buildWindow(
++          chunks,
++          { offset: input.offset, limit: input.limit, maxLineLength: caps.maxLineLength, maxBytes: caps.maxBytes },
++          target.displayPath,
++        )
+ 
+-      const outcome = {
+-        path: target.displayPath,
+-        offset: input.offset,
+-        lines: window.lines,
+-        totalLines: window.totalLines,
++        const outcome = {
++          path: target.displayPath,
++          offset: input.offset,
++          lines: window.lines,
++          totalLines: window.totalLines,
++        }
++        // Record the present observation (a no-op when no policy plugin listens). The
++        // read already succeeded; an fs/observed listener is contractually a
++        // synchronous, side-effect-only recorder.
++        ctx.emit('fs/observed', target, { kind: 'present', version: info.version }, exec)
++        return outcome
++      } catch (error: unknown) {
++        if (sandbox !== undefined && sandboxPolicy !== undefined) throw sandbox.mapError(error, sandboxPolicy)
++        throw error
+       }
+-      // Record the present observation (a no-op when no policy plugin listens). The
+-      // read already succeeded; an fs/observed listener is contractually a
+-      // synchronous, side-effect-only recorder.
+-      ctx.emit('fs/observed', target, { kind: 'present', version: info.version }, exec)
+-      return outcome
+     },
+     // Result-time display: a `read` card carrying the structured line window a
+     // capable UI renders as a line-numbered, syntax-highlighted view. The
+diff --git a/packages/fs/tool-str-replace-editor/src/index.ts b/packages/fs/tool-str-replace-editor/src/index.ts
+index f777366..afd6606 100644
+--- a/packages/fs/tool-str-replace-editor/src/index.ts
++++ b/packages/fs/tool-str-replace-editor/src/index.ts
+@@ -216,6 +216,7 @@ async function listDirectory(
+ 
+ async function viewPath(
+   ctx: Context,
++  policy: MutationPolicy,
+   path: string,
+   viewRange: number[] | undefined,
+   maxOutputChars: number,
+@@ -232,7 +233,17 @@ async function viewPath(
+   if (info.type !== 'file') {
+     throw new FsError(`cannot view "${target.displayPath}": not a regular file or directory`, 'FS_NOT_REGULAR_FILE')
+   }
+-  const content = await ctx.fs.readText(target, exec.signal)
++  // QVD-2026-52632: a view is a content read, so it resolves the session's
++  // sandbox policy exactly like the mutation paths do. Without this the editor
++  // could read host secrets outside the workspace that every other
++  // model-facing file tool already refuses.
++  const sandboxPolicy = policy.resolve(exec)
++  let content: string
++  try {
++    content = await ctx.fs.readText(target, exec.signal, sandboxPolicy)
++  } catch (error: unknown) {
++    throw policy.mapError(error, sandboxPolicy)
++  }
+   ctx.emit('fs/observed', target, { kind: 'present', version: info.version }, exec)
+   return formatFileView(target.displayPath, content, maxOutputChars, viewRange)
+ }
+@@ -292,7 +303,12 @@ async function replaceInFile(
+   if (info.type !== 'file') {
+     throw new FsError(`cannot edit "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+   }
+-  const before = await ctx.fs.readText(target, exec.signal)
++  let before: string
++  try {
++    before = await ctx.fs.readText(target, exec.signal, sandboxPolicy)
++  } catch (error: unknown) {
++    throw policy.mapError(error, sandboxPolicy)
++  }
+   const offsets = matchOffsets(before, oldValue)
+   const offset = offsets[0]
+   if (offset === undefined) {
+@@ -343,7 +359,12 @@ async function insertInFile(
+   if (info.type !== 'file') {
+     throw new FsError(`cannot insert into "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+   }
+-  const before = await ctx.fs.readText(target, exec.signal)
++  let before: string
++  try {
++    before = await ctx.fs.readText(target, exec.signal, sandboxPolicy)
++  } catch (error: unknown) {
++    throw policy.mapError(error, sandboxPolicy)
++  }
+   const lines = before.split('\n')
+   if (!Number.isInteger(insertLine) || insertLine < 0 || insertLine > lines.length) {
+     throw new Error(
+@@ -471,7 +492,7 @@ function registerStrReplaceEditor(ctx: Context, config: ResolvedConfig): void {
+     async execute(args, exec) {
+       switch (args.command) {
+         case 'view':
+-          return viewPath(ctx, args.path, args.view_range ?? undefined, config.maxOutputChars, exec)
++          return viewPath(ctx, policy, args.path, args.view_range ?? undefined, config.maxOutputChars, exec)
+         case 'create':
+           return createFile(ctx, policy, args.path, args.file_text ?? undefined, exec)
+         case 'str_replace':
+diff --git a/packages/guard/repeat-text-reminder/README.md b/packages/guard/repeat-text-reminder/README.md
+new file mode 100644
+index 0000000..e09d3a5
+--- /dev/null
++++ b/packages/guard/repeat-text-reminder/README.md
+@@ -0,0 +1,56 @@
++# @deepseek-ai/dsh-repeat-text-reminder
++
++Advisory per-agent repeat-**text** detector. It watches the assistant text an agent commits across consecutive steps of one turn and, when the same text recurs, injects a logged model context asking it to stop repeating.
++
++## Why this exists
++
++`@deepseek-ai/dsh-repeat-tool-reminder` observes `tools/post-execute`, so it only sees a loop that goes **through tool calls**. A model that emits the same plain text step after step — with no tool call — never reaches that guard, and the agent loop has no text-level loop detection of its own.
++
++The loop itself is not at fault. `packages/core/agent-loop/src/agent.ts` ends a turn as soon as a step produces no tool call:
++
++```ts
++const toolCalls = message.content.filter(block => block.type === 'tool-call')
++if (toolCalls.length === 0) return { kind: 'completed' }
++```
++
++Verified by `packages/core/agent-loop/tests/redteam-loop-termination.spec.ts`: a scripted adapter returning plain text is requested **exactly once**. Repetition therefore originates in the model's own output. This guard covers the case where the model keeps producing tool calls **and** the same narration text.
++
++## Detection is structural, not a phrase blacklist
++
++The guard compares the **normalized text** of consecutive assistant messages and counts a run:
++
++- normalization folds whitespace runs and trims; punctuation, wording, and case stay significant;
++- any content change resets the run, so repeating a word or a heading is not a loop;
++- texts shorter than `minChars` are not counted at all, so ordinary acknowledgements (`ok`, `好。`) never fire it.
++
++No specific word is ever matched. Adding a phrase to a blacklist would not fix the state cycle and would silently stop working the moment the model rephrases.
++
++## Configuration
++
++```yaml
++- id: repeat-text-reminder
++  config:
++    thresholds: [3, 5, 8]   # consecutive identical-text counts that trigger a reminder
++    minChars: 8             # minimum normalized length to count; 0 counts every non-empty text
++    textPreviewChars: 200   # cap on the text quoted in the detailed reminder
++```
++
++Misconfiguration fails loud at plugin load: an empty `thresholds` list, a non-integer, a value below 2, or a duplicate throws rather than silently falling back.
++
++## Behavior
++
++- The reminder is stamped `{ kind: 'plugin', plugin: 'repeat-text-reminder', form: 'notice' }`, so derived history renders it as a notice rather than a user prompt.
++- The first threshold delivers gentle text; later thresholds name the run length and quote the repeated text.
++- The listener always delegates (`next()`), then folds the reminder onto whatever the downstream decision was. A `reject` decision is returned unchanged.
++- A genuine user interjection resets the chain: repetition across it is not a loop.
++- Chains are keyed per Agent, so one agent repeating never trips another.
++
++## Model Experience
++
++The guard adds one `notice`-form user message to the next step's input when a run reaches a threshold. It never rewrites, blocks, or reorders the model's own output, and it adds nothing when no repetition is detected — a well-behaved turn sees zero added tokens.
++
++## Known Limitations and Deferred Work
++
++- The guard is **advisory**: it asks the model to stop, it does not terminate the turn. A model that ignores the reminder keeps running. A hard iteration cap belongs to the loop, not to an advisory reader.
++- Detection runs on `agent/pre-step`, so it observes text **after** it was committed. It cannot prevent the first repetition, only discourage the next.
++- Semantically equivalent but differently worded repetition is not detected; that would require model-side judgement, not a text comparison.
+diff --git a/packages/guard/repeat-text-reminder/package.json b/packages/guard/repeat-text-reminder/package.json
+new file mode 100644
+index 0000000..ec45e81
+--- /dev/null
++++ b/packages/guard/repeat-text-reminder/package.json
+@@ -0,0 +1,45 @@
++{
++  "name": "@deepseek-ai/dsh-repeat-text-reminder",
++  "description": "Repeat-text guard plugin: advisory reminders when an agent emits the same assistant text across consecutive steps",
++  "version": "0.1.5-rc.2",
++  "publishConfig": {
++    "access": "public"
++  },
++  "repository": {
++    "type": "git",
++    "url": "git+https://github.com/deepseek-ai/deepseek-harness.git",
++    "directory": "packages/guard/repeat-text-reminder"
++  },
++  "type": "module",
++  "main": "lib/index.js",
++  "types": "lib/types/index.d.ts",
++  "exports": {
++    ".": {
++      "types": "./lib/types/index.d.ts",
++      "default": "./lib/index.js"
++    },
++    "./src/*": "./src/*",
++    "./package.json": "./package.json"
++  },
++  "files": [
++    "lib/index.js",
++    "lib/types/**/*.d.ts"
++  ],
++  "license": "MIT",
++  "dependencies": {
++    "@deepseek-ai/schemastery": "workspace:^"
++  },
++  "peerDependencies": {
++    "@deepseek-ai/dsh-agent": "workspace:^",
++    "@deepseek-ai/cordis": "workspace:^"
++  },
++  "devDependencies": {
++    "@deepseek-ai/dsh-agent": "workspace:^",
++    "@deepseek-ai/dsh-agent-loop": "workspace:^",
++    "@deepseek-ai/dsh-agent-loop-testkit": "workspace:^",
++    "@deepseek-ai/dsh-llm": "workspace:^",
++    "@deepseek-ai/dsh-session": "workspace:^",
++    "@deepseek-ai/cordis": "workspace:^",
++    "@deepseek-ai/dsh-session-projection": "workspace:^"
++  }
++}
+diff --git a/packages/guard/repeat-text-reminder/src/index.ts b/packages/guard/repeat-text-reminder/src/index.ts
+new file mode 100644
+index 0000000..3936374
+--- /dev/null
++++ b/packages/guard/repeat-text-reminder/src/index.ts
+@@ -0,0 +1,224 @@
++/**
++ * Advisory per-agent repeat-TEXT detector. It watches the assistant text an
++ * agent commits across consecutive steps of one turn and, when the same text
++ * recurs, injects a logged model context asking it to stop repeating.
++ *
++ * Why this exists: `repeat-tool-reminder` observes `tools/post-execute`, so it
++ * can only see a loop that goes through tool calls. A model that emits the same
++ * plain text step after step — with no tool call at all — never reaches that
++ * guard, and the agent loop has no text-level loop detection of its own. The
++ * loop itself is not at fault: `agent.ts` ends the turn as soon as a step
++ * produces no tool call. This guard covers the case where the model keeps
++ * producing tool calls AND the same narration text, and the case where the same
++ * text rides along with an otherwise-progressing turn.
++ *
++ * Detection is structural, never a phrase blacklist: it compares the normalized
++ * text of consecutive assistant messages and counts a run. Any content change
++ * resets the run, so ordinary repetition of a word or a heading is not a loop.
++ *
++ * @module @deepseek-ai/dsh-repeat-text-reminder
++ */
++
++import type { Context } from '@deepseek-ai/cordis'
++import z from '@deepseek-ai/schemastery'
++import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
++import { createUserMessage } from '@deepseek-ai/dsh-llm'
++import type { MessageSource } from '@deepseek-ai/dsh-llm'
++import type { SessionEvent, UserMessage } from '@deepseek-ai/dsh-session'
++
++export const name = 'repeat-text-reminder'
++
++/**
++ * Plugin config, validated by the same-named schemastery schema plus the
++ * load-time checks in `apply` (misconfiguration fails loud: an empty
++ * `thresholds` list, a non-integer, a value below 2, or a duplicate throws at
++ * plugin load, never a silent fall-back).
++ */
++export interface Config {
++  /** Consecutive identical-text counts that trigger a reminder (default `[3, 5, 8]`). */
++  thresholds?: number[]
++  /**
++   * Minimum normalized length a text must reach before it can be counted
++   * (default 8). Very short outputs ("ok", "好。") are extremely common as
++   * legitimate acknowledgements, so counting them would fire on ordinary work;
++   * the floor keeps the detector on substantive repetition. Set `0` to count
++   * every non-empty text.
++   */
++  minChars?: number
++  /**
++   * Maximum characters of the repeated text quoted in the DETAILED reminder
++   * (default 200). The cap bounds the reminder, never the detection.
++   */
++  textPreviewChars?: number
++}
++
++export const Config: z<Config> = z.object({
++  thresholds: z.array(z.number()).default([3, 5, 8]),
++  minChars: z.number().default(8),
++  textPreviewChars: z.number().default(200),
++})
++
++/**
++ * The `{kind:'plugin'}` source stamped on every reminder this guard injects —
++ * the label is load-bearing (an unlabeled context would render as a user prompt
++ * in derived history).
++ */
++const PLUGIN_SOURCE: MessageSource = { kind: 'plugin', plugin: 'repeat-text-reminder' }
++
++/** The gentle first-threshold reminder, keyed to `thresholds[0]`. */
++const GENTLE_REMINDER =
++  'You have emitted the same assistant text across consecutive steps. '
++  + 'Repeating narration does not make progress: either take the next concrete '
++  + 'action the task needs, or state plainly what is blocking you and stop.'
++
++/**
++ * The detailed later-threshold reminder naming the run length and quoting the
++ * repeated text.
++ * @param count - consecutive identical texts observed.
++ * @param preview - the (truncated) repeated text.
++ * @returns the reminder text.
++ */
++function detailedReminder(count: number, preview: string): string {
++  return `You have now emitted the same assistant text ${String(count)} times in a row. `
++    + 'The repeated text is not making progress. Stop repeating it: change approach, '
++    + 'ask for the missing input, or finish the turn.\n\nRepeated text:\n'
++    + preview
++}
++
++/**
++ * Validate `thresholds` per the fail-loud contract and return them sorted
++ * ascending (the escalation rule reads `thresholds[0]` as the gentle tier).
++ * @param values - configured thresholds.
++ * @returns the ascending, de-duplicated thresholds.
++ * @throws when the list is empty, holds a non-integer, or holds a value below 2.
++ */
++function validateThresholds(values: number[]): number[] {
++  if (values.length === 0) {
++    throw new Error('repeat-text-reminder: `thresholds` must not be empty')
++  }
++  for (const value of values) {
++    if (!Number.isInteger(value) || value < 2) {
++      throw new Error(`repeat-text-reminder: invalid threshold ${String(value)} — every threshold must be an integer >= 2`)
++    }
++  }
++  if (new Set(values).size !== values.length) {
++    throw new Error('repeat-text-reminder: `thresholds` must not contain duplicates')
++  }
++  return [...values].sort((left, right) => left - right)
++}
++
++/**
++ * Normalize one assistant text for comparison: collapse whitespace runs and
++ * trim. Only whitespace is folded — punctuation, wording, and case stay
++ * significant, so two genuinely different sentences never compare equal.
++ * @param text - the raw assistant text.
++ * @returns the comparison key.
++ */
++function normalize(text: string): string {
++  return text.replace(/\s+/gu, ' ').trim()
++}
++
++/**
++ * The joined text of one committed assistant message, or `undefined` when the
++ * message carried no text block at all (a pure tool-call step).
++ * @param event - a session event.
++ * @returns the joined assistant text, or undefined.
++ */
++function assistantTextOf(event: SessionEvent): string | undefined {
++  if (event.type !== 'assistant/message') return undefined
++  const message = (event.data as { message: { content: { type: string; text?: string }[] } }).message
++  const text = message.content
++    .filter(block => block.type === 'text')
++    .map(block => block.text ?? '')
++    .join('')
++  return text === '' ? undefined : text
++}
++
++/** One agent's consecutive-identical-text chain: the last key and its run length. */
++interface TextChain {
++  key: string
++  count: number
++}
++
++/**
++ * Register the repeat-text guard.
++ * @param ctx - owning plugin context; the listener is an effect on it.
++ * @param config - resolved plugin config (schema defaults applied).
++ */
++export function apply(ctx: Context, config?: Config): void {
++  const thresholds = validateThresholds(config?.thresholds as number[])
++  const thresholdSet = new Set(thresholds)
++  const minChars = config?.minChars ?? 8
++  const textPreviewChars = config?.textPreviewChars ?? 200
++  if (!Number.isInteger(minChars) || minChars < 0) {
++    throw new Error(`repeat-text-reminder: invalid minChars ${String(minChars)} — must be an integer >= 0`)
++  }
++  if (!Number.isInteger(textPreviewChars) || textPreviewChars < 1) {
++    throw new Error(`repeat-text-reminder: invalid textPreviewChars ${String(textPreviewChars)} — must be an integer >= 1`)
++  }
++
++  /** Per-agent chain state; keyed by the Agent object like the tool guard. */
++  const chains = new Map<Agent, TextChain>()
++
++  /**
++   * Read the newest committed assistant text of one agent, if any.
++   * @param agent - the agent whose session log is read.
++   * @returns the normalized key and raw text, or undefined.
++   */
++  function latestAssistantText(agent: Agent): { key: string; raw: string } | undefined {
++    const events = agent.session.snapshotEvents()
++    for (let index = events.length - 1; index >= 0; index -= 1) {
++      const event = events[index]
++      if (event === undefined) continue
++      const text = assistantTextOf(event)
++      if (text === undefined) continue
++      const key = normalize(text)
++      if (key.length < minChars) return undefined
++      return { key, raw: key }
++    }
++    return undefined
++  }
++  /**
++   * Advance the calling agent's chain for the text it just produced and return
++   * the reminder to deliver when the run length hits a configured threshold.
++   * @param agent - the agent whose step is starting.
++   * @returns the reminder message, or undefined.
++   */
++  function observe(agent: Agent): UserMessage | undefined {
++    const latest = latestAssistantText(agent)
++    if (latest === undefined) {
++      // No countable text yet (first step, or a short acknowledgement): the
++      // chain is not advanced, so a run only ever counts substantive repeats.
++      return undefined
++    }
++    const chain = chains.get(agent)
++    const count = chain !== undefined && chain.key === latest.key ? chain.count + 1 : 1
++    chains.set(agent, { key: latest.key, count })
++    if (!thresholdSet.has(count)) return undefined
++    const preview = latest.raw.length > textPreviewChars
++      ? `${latest.raw.slice(0, textPreviewChars)}…`
++      : latest.raw
++    const text = count === thresholds[0]
++      ? GENTLE_REMINDER
++      : detailedReminder(count, preview)
++    return createUserMessage({
++      content: [{ type: 'text', text }],
++      source: { ...PLUGIN_SOURCE, form: 'notice', summary: `repeated text × ${String(count)}` },
++    })
++  }
++
++  // Observe-and-enrich, never veto: the reminder rides onto whatever the
++  // downstream decision was, so a rejected step still carries the nudge. A
++  // genuine user interjection resets the chain — repetition across it is not a
++  // loop.
++  ctx.on('agent/pre-step', async ({ agent, messages }, next): Promise<PreStepDecision> => {
++    const downstream = await next()
++    if (messages.some(message => message.source.kind === 'user')) {
++      chains.delete(agent)
++      return downstream
++    }
++    const reminder = observe(agent)
++    if (reminder === undefined || downstream.kind === 'reject') return downstream
++    return { ...downstream, messages: [...downstream.messages, reminder] }
++  })
++}
+diff --git a/packages/guard/repeat-text-reminder/tests/repeat-text-reminder.spec.ts b/packages/guard/repeat-text-reminder/tests/repeat-text-reminder.spec.ts
+new file mode 100644
+index 0000000..e082913
+--- /dev/null
++++ b/packages/guard/repeat-text-reminder/tests/repeat-text-reminder.spec.ts
+@@ -0,0 +1,244 @@
++/**
++ * Behavior + adversarial suite for the repeat-text guard.
++ *
++ * The guard enriches the `agent/pre-step` decision: it returns the reminder as
++ * an extra entry in `messages`, and the loop is what commits it. These tests
++ * therefore assert on the returned decision, which is the guard's actual
++ * contract.
++ *
++ * The adversarial cases prove it does NOT fire on ordinary work — that is the
++ * failure mode that matters for an advisory guard, because a false positive
++ * injects noise into every turn.
++ */
++
++import { describe, expect, it } from 'vitest'
++import { Context } from '@deepseek-ai/cordis'
++import { createUserMessage } from '@deepseek-ai/dsh-llm'
++import { SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
++import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
++import AgentLoop from '@deepseek-ai/dsh-agent-loop'
++import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
++import * as RepeatTextGuard from '@deepseek-ai/dsh-repeat-text-reminder'
++import type { Config } from '@deepseek-ai/dsh-repeat-text-reminder'
++import { MockAdapter, textResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
++
++/** Boot the core spine + the guard; the caller registers adapters. */
++async function harness(config: Config = {}): Promise<Context> {
++  const ctx = new Context()
++  await mountAgentLoopTestDependencies(ctx)
++  await ctx.plugin(AgentLoop, { agents: [] })
++  await ctx.plugin(RepeatTextGuard, config)
++  return ctx
++}
++
++function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
++  return new Promise((resolve) => {
++    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
++      if (subject === agent && status === 'idle') { dispose(); resolve() }
++    })
++  })
++}
++
++/** Commit one assistant text message the way the loop does (surface-eligible needs a marker). */
++function appendAssistant(agent: Agent, step: number, text: string): void {
++  agent.session.append('assistant/message', {
++    turn: 1,
++    step,
++    message: { role: 'assistant', content: [{ type: 'text', text }] },
++  } as never, { surfaceOp: 'append' })
++}
++
++/** Drive one pre-step boundary and return the decision the guard produced. */
++async function preStep(
++  ctx: Context,
++  agent: Agent,
++  step: number,
++  messages: UserMessage[] = [],
++): Promise<PreStepDecision> {
++  return await ctx.waterfall(
++    'agent/pre-step',
++    { agent, messages, turn: 1, step, signal: new AbortController().signal },
++    async (): Promise<PreStepDecision> => ({ kind: 'enter', messages: [] }),
++  ) as PreStepDecision
++}
++
++/** The injected texts a decision carries (empty when it rejected or added none). */
++function injectedTexts(decision: PreStepDecision): string[] {
++  if (decision.kind !== 'enter') return []
++  return decision.messages.map(message =>
++    message.content.map(block => block.type === 'text' ? block.text : '').join(''))
++}
++
++async function agentOf(ctx: Context, id: string): Promise<Agent> {
++  return await ctx.agentLoop.create(SessionId(id), { provider: 'mock', model: 'mock' })
++}
++
++describe('repeat-text guard — fires on a genuine text loop', () => {
++  it('reminds at the configured threshold', async () => {
++    const ctx = await harness({ thresholds: [2] })
++    const agent = await agentOf(ctx, 'direct')
++    appendAssistant(agent, 1, 'I will now examine the file.')
++    expect(injectedTexts(await preStep(ctx, agent, 2))).toHaveLength(0)
++    appendAssistant(agent, 2, 'I will now examine the file.')
++    const texts = injectedTexts(await preStep(ctx, agent, 3))
++    expect(texts).toHaveLength(1)
++    expect(texts[0]).toContain('same assistant text')
++  })
++
++  it('escalates to the detailed reminder at the later threshold', async () => {
++    const ctx = await harness({ thresholds: [2, 3] })
++    const agent = await agentOf(ctx, 'escalate')
++    const body = 'The same long narration text repeated verbatim.'
++    const seen: string[] = []
++    for (let step = 1; step <= 3; step += 1) {
++      appendAssistant(agent, step, body)
++      seen.push(...injectedTexts(await preStep(ctx, agent, step + 1)))
++    }
++    expect(seen.some(t => t.includes('same assistant text'))).toBe(true)
++    expect(seen.some(t => t.includes('3 times in a row'))).toBe(true)
++  })
++
++  it('stamps the notice source so derived history does not read it as a user prompt', async () => {
++    const ctx = await harness({ thresholds: [2] })
++    const agent = await agentOf(ctx, 'source')
++    appendAssistant(agent, 1, 'Repeated body text that is long enough to count.')
++    await preStep(ctx, agent, 2)
++    appendAssistant(agent, 2, 'Repeated body text that is long enough to count.')
++    const decision = await preStep(ctx, agent, 3)
++    expect(decision.kind).toBe('enter')
++    if (decision.kind !== 'enter') return
++    expect(decision.messages[0]!.source).toMatchObject({
++      kind: 'plugin', plugin: 'repeat-text-reminder', form: 'notice',
++    })
++  })
++
++  it('treats whitespace-only differences as the same text', async () => {
++    const ctx = await harness({ thresholds: [2] })
++    const agent = await agentOf(ctx, 'ws')
++    appendAssistant(agent, 1, 'Examining   the   file now.')
++    await preStep(ctx, agent, 2)
++    appendAssistant(agent, 2, 'Examining the file now.')
++    expect(injectedTexts(await preStep(ctx, agent, 3))).toHaveLength(1)
++  })
++})
++
++describe('repeat-text guard — adversarial: must NOT fire on ordinary work', () => {
++  it('does not fire on a single plain-text answer', async () => {
++    const ctx = await harness()
++    const agent = await agentOf(ctx, 'single')
++    appendAssistant(agent, 1, 'Here is the answer you asked for.')
++    expect(injectedTexts(await preStep(ctx, agent, 2))).toHaveLength(0)
++  })
++
++  it('does not fire on short acknowledgements even when repeated five times', async () => {
++    // 'ok' / '好。' are legitimate one-word replies; counting them would make
++    // the guard fire on ordinary conversation.
++    for (const short of ['ok', '好。', 'done', 'yes']) {
++      const ctx = await harness({ thresholds: [2], minChars: 8 })
++      const agent = await agentOf(ctx, `short-${short}`)
++      const seen: string[] = []
++      for (let step = 1; step <= 5; step += 1) {
++        appendAssistant(agent, step, short)
++        seen.push(...injectedTexts(await preStep(ctx, agent, step + 1)))
++      }
++      expect(seen).toHaveLength(0)
++    }
++  })
++
++  it('does not fire when the text changes each step (real progress)', async () => {
++    const ctx = await harness({ thresholds: [2] })
++    const agent = await agentOf(ctx, 'progress')
++    const bodies = [
++      'Step one: reading the configuration file now.',
++      'Step two: the configuration parsed without errors.',
++      'Step three: applying the requested change.',
++      'Step four: verifying the result of the change.',
++    ]
++    const seen: string[] = []
++    for (const [index, body] of bodies.entries()) {
++      appendAssistant(agent, index + 1, body)
++      seen.push(...injectedTexts(await preStep(ctx, agent, index + 2)))
++    }
++    expect(seen).toHaveLength(0)
++  })
++
++  it('resets the chain on a genuine user interjection', async () => {
++    const ctx = await harness({ thresholds: [2] })
++    const agent = await agentOf(ctx, 'reset')
++    const body = 'The same narration text repeated across steps.'
++    appendAssistant(agent, 1, body)
++    // A real user message arrives: the chain must reset.
++    await preStep(ctx, agent, 2, [createUserMessage({ content: [{ type: 'text', text: 'stop' }], source: { kind: 'user' } })])
++    appendAssistant(agent, 2, body)
++    // After the reset the run restarts at 1, so threshold 2 is not reached.
++    expect(injectedTexts(await preStep(ctx, agent, 3))).toHaveLength(0)
++  })
++
++  it('never vetoes: a reject decision passes through unchanged', async () => {
++    const ctx = await harness({ thresholds: [2] })
++    const agent = await agentOf(ctx, 'reject')
++    appendAssistant(agent, 1, 'Repeated narration long enough to be counted.')
++    await preStep(ctx, agent, 2)
++    appendAssistant(agent, 2, 'Repeated narration long enough to be counted.')
++    const decision = await ctx.waterfall(
++      'agent/pre-step',
++      { agent, messages: [], turn: 1, step: 9, signal: new AbortController().signal },
++      async (): Promise<PreStepDecision> => ({ kind: 'reject' }),
++    )
++    expect(decision).toEqual({ kind: 'reject' })
++  })
++
++  it('keeps chains per agent: one agent repeating never trips another', async () => {
++    const ctx = await harness({ thresholds: [2] })
++    const a = await agentOf(ctx, 'agent-a')
++    const b = await agentOf(ctx, 'agent-b')
++    appendAssistant(a, 1, 'Agent A keeps saying exactly this same thing.')
++    await preStep(ctx, a, 2)
++    appendAssistant(a, 2, 'Agent A keeps saying exactly this same thing.')
++    expect(injectedTexts(await preStep(ctx, a, 3))).toHaveLength(1)
++    appendAssistant(b, 1, 'Agent B says something entirely different here.')
++    expect(injectedTexts(await preStep(ctx, b, 2))).toHaveLength(0)
++  })
++})
++
++describe('repeat-text guard — end to end through the real loop', () => {
++  it('a normal single-answer turn adds no context at all', async () => {
++    const adapter = new MockAdapter([textResponse('Here is the answer you asked for.')])
++    const ctx = await harness()
++    ctx.llm.registerAdapter(['mock'], adapter)
++    const agent = await agentOf(ctx, 'e2e-single')
++    const idle = waitForIdle(ctx, agent)
++    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
++    await idle
++    expect(adapter.requests.length).toBe(1)
++    const injected = agent.session.snapshotEvents()
++      .filter(e => e.type === 'user/message' && e.data.source.kind !== 'user')
++    expect(injected).toHaveLength(0)
++  })
++})
++
++describe('repeat-text guard — fail-loud configuration', () => {
++  it('rejects an empty thresholds list', async () => {
++    const ctx = new Context()
++    await mountAgentLoopTestDependencies(ctx)
++    await expect(ctx.plugin(RepeatTextGuard, { thresholds: [] })).rejects.toThrow(/must not be empty/)
++  })
++
++  it('rejects a threshold below 2', async () => {
++    const ctx = new Context()
++    await mountAgentLoopTestDependencies(ctx)
++    await expect(ctx.plugin(RepeatTextGuard, { thresholds: [1] })).rejects.toThrow(/integer >= 2/)
++  })
++
++  it('rejects duplicate thresholds', async () => {
++    const ctx = new Context()
++    await mountAgentLoopTestDependencies(ctx)
++    await expect(ctx.plugin(RepeatTextGuard, { thresholds: [3, 3] })).rejects.toThrow(/duplicates/)
++  })
++
++  it('rejects a negative minChars', async () => {
++    const ctx = new Context()
++    await mountAgentLoopTestDependencies(ctx)
++    await expect(ctx.plugin(RepeatTextGuard, { minChars: -1 })).rejects.toThrow(/minChars/)
++  })
++})
+diff --git a/packages/guard/repeat-text-reminder/tsconfig.json b/packages/guard/repeat-text-reminder/tsconfig.json
+new file mode 100644
+index 0000000..56ae17c
+--- /dev/null
++++ b/packages/guard/repeat-text-reminder/tsconfig.json
+@@ -0,0 +1,21 @@
++{
++  "extends": "../../../tsconfig.base.json",
++  "compilerOptions": {
++    "rootDir": "src",
++    "outDir": "lib/types"
++  },
++  "include": [
++    "src"
++  ],
++  "references": [
++    {
++      "path": "../../../vendor/cordis"
++    },
++    {
++      "path": "../../../vendor/schemastery"
++    },
++    {
++      "path": "../../core/agent"
++    }
++  ]
++}
+diff --git a/packages/llm/llm-deepseek/src/adapter.ts b/packages/llm/llm-deepseek/src/adapter.ts
+index be165c1..9114dec 100644
+--- a/packages/llm/llm-deepseek/src/adapter.ts
++++ b/packages/llm/llm-deepseek/src/adapter.ts
+@@ -172,30 +172,30 @@ const MAX_REASONING_EFFORT = ReasoningEffortId('max')
+ const REASONING_EFFORTS = [
+   {
+     id: OFF_REASONING_EFFORT,
+-    name: 'Off',
+-    description: 'Use for simple tasks that do not need reasoning.',
++    name: '关闭',
++    description: '用于不需要推理的简单任务。',
+   },
+   {
+     id: LOW_REASONING_EFFORT,
+-    name: 'Low',
+-    description: 'Prefer for routine or latency-sensitive tasks.',
++    name: '低',
++    description: '适合常规任务或对延迟敏感的任务。',
+   },
+   {
+     id: HIGH_REASONING_EFFORT,
+-    name: 'High',
+-    description: 'The default balance for most tasks.',
++    name: '高',
++    description: '大多数任务的默认平衡档位。',
+   },
+   {
+     id: MAX_REASONING_EFFORT,
+-    name: 'Max',
+-    description: 'Reserve for the hardest quality-first tasks.',
++    name: '最高',
++    description: '留给难度最高、最看重质量的任务。',
+   },
+ ] as const
+ const OFF_ONLY_REASONING_EFFORTS = [
+   {
+     id: OFF_REASONING_EFFORT,
+-    name: 'Off',
+-    description: 'Use for simple tasks that do not need reasoning.',
++    name: '关闭',
++    description: '用于不需要推理的简单任务。',
+   },
+ ] as const
+ 
+diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deepseek/src/serialize.ts
+index 1749991..dd4890f 100644
+--- a/packages/llm/llm-deepseek/src/serialize.ts
++++ b/packages/llm/llm-deepseek/src/serialize.ts
+@@ -365,6 +365,9 @@ function requestWithMessages(
+       : {},
+     ...tools !== undefined && tools.length > 0 ? { tools } : {},
+     ...options.temperature !== undefined ? { temperature: options.temperature } : {},
++    ...options.topP === undefined ? {} : { top_p: options.topP },
++    ...options.frequencyPenalty === undefined ? {} : { frequency_penalty: options.frequencyPenalty },
++    ...options.presencePenalty === undefined ? {} : { presence_penalty: options.presencePenalty },
+     ...options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens },
+     ...options.stop !== undefined ? { stop: options.stop } : {},
+   }
+diff --git a/packages/llm/llm-deepseek/src/types.ts b/packages/llm/llm-deepseek/src/types.ts
+index 38e73ed..87fafdd 100644
+--- a/packages/llm/llm-deepseek/src/types.ts
++++ b/packages/llm/llm-deepseek/src/types.ts
+@@ -21,6 +21,12 @@ export interface WireRequest {
+   reasoning_effort?: 'low' | 'high' | 'max'
+   tools?: WireTool[]
+   temperature?: number
++  /** Nucleus sampling cutoff (OpenAI `top_p`). Omitted when unset. */
++  top_p?: number
++  /** Repetition penalty (OpenAI `frequency_penalty`). Omitted when unset. */
++  frequency_penalty?: number
++  /** Novelty penalty (OpenAI `presence_penalty`). Omitted when unset. */
++  presence_penalty?: number
+   max_tokens?: number
+   /**
+    * Stop sequences (OpenAI `stop`): generation halts as soon as the model
+diff --git a/packages/llm/llm/src/call-config.ts b/packages/llm/llm/src/call-config.ts
+index 9d012cd..b850c09 100644
+--- a/packages/llm/llm/src/call-config.ts
++++ b/packages/llm/llm/src/call-config.ts
+@@ -25,6 +25,9 @@ export interface LlmCallConfig {
+   model: string
+   reasoningEffort?: ReasoningEffortId
+   temperature?: number
++  topP?: number
++  frequencyPenalty?: number
++  presencePenalty?: number
+   maxTokens?: number
+   stop?: string[]
+ }
+@@ -52,6 +55,9 @@ export function callConfigEquals(a: LlmCallConfig, b: LlmCallConfig): boolean {
+     || a.model !== b.model
+     || a.reasoningEffort !== b.reasoningEffort
+     || a.temperature !== b.temperature
++    || a.topP !== b.topP
++    || a.frequencyPenalty !== b.frequencyPenalty
++    || a.presencePenalty !== b.presencePenalty
+     || a.maxTokens !== b.maxTokens
+   ) return false
+   if (a.stop === undefined || b.stop === undefined) return a.stop === b.stop
+diff --git a/packages/llm/llm/src/types.ts b/packages/llm/llm/src/types.ts
+index bfddde7..299885c 100644
+--- a/packages/llm/llm/src/types.ts
++++ b/packages/llm/llm/src/types.ts
+@@ -437,6 +437,15 @@ export interface GenerateOptions {
+   /** Tool schemas (adapters map to the provider's `tools` field). */
+   tools?: ToolSchema[]
+   temperature?: number
++  /**
++   * Nucleus sampling cutoff; adapters map to the provider's `top_p` field
++   * (e.g. OpenAI `top_p`). Omitted when unset so provider defaults apply.
++   */
++  topP?: number
++  /** Repetition penalty; adapters map to the provider's `frequency_penalty`. */
++  frequencyPenalty?: number
++  /** Novelty penalty; adapters map to the provider's `presence_penalty`. */
++  presencePenalty?: number
+   maxTokens?: number
+   /**
+    * Stop sequences: generation halts as soon as the model produces any one of
+diff --git a/packages/shell/bash-local/src/index.ts b/packages/shell/bash-local/src/index.ts
+index 0ab4c03..7f58933 100644
+--- a/packages/shell/bash-local/src/index.ts
++++ b/packages/shell/bash-local/src/index.ts
+@@ -192,6 +192,13 @@ export class LocalBashExecutor extends ShellExecutor {
+       },
+       graceMs: this.config.graceMs,
+       signal,
++      // A restrictive policy reaches this spawn only after the sandboxing
++      // executor wrapped argv through ctx.sandbox.confine, so declare the
++      // confinement at the execution point; the subprocess provider refuses a
++      // restricted-policy spawn that does not declare it (QVD-2026-52646).
++      ...spec.sandboxPolicy !== undefined && spec.sandboxPolicy.mode !== 'danger-full-access'
++        ? { sandboxPolicy: spec.sandboxPolicy, argvConfined: true as const }
++        : {},
+       // One explicit env map for the seam, layered so the trusted dshEnv
+       // snapshot beats both the caller's env and the terminal overrides; the
+       // subprocess service merges the whole map after its ambient scrub.
+diff --git a/packages/shell/pwsh-local/src/index.ts b/packages/shell/pwsh-local/src/index.ts
+index 99d7d15..9473c57 100644
+--- a/packages/shell/pwsh-local/src/index.ts
++++ b/packages/shell/pwsh-local/src/index.ts
+@@ -239,6 +239,13 @@ export class PwshLocalExecutor extends ShellExecutor {
+       },
+       graceMs: this.config.graceMs,
+       signal,
++      // A restrictive policy reaches this spawn only after the sandboxing
++      // executor wrapped argv through ctx.sandbox.confine, so declare the
++      // confinement at the execution point; the subprocess provider refuses a
++      // restricted-policy spawn that does not declare it (QVD-2026-52646).
++      ...spec.sandboxPolicy !== undefined && spec.sandboxPolicy.mode !== 'danger-full-access'
++        ? { sandboxPolicy: spec.sandboxPolicy, argvConfined: true as const }
++        : {},
+       env: { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv },
+     }
+   }
+diff --git a/packages/subprocess/subprocess-local/src/spawn.ts b/packages/subprocess/subprocess-local/src/spawn.ts
+index 9079716..76c8e3c 100644
+--- a/packages/subprocess/subprocess-local/src/spawn.ts
++++ b/packages/subprocess/subprocess-local/src/spawn.ts
+@@ -353,6 +353,34 @@ function signalTree(
+   }
+ }
+ 
++/**
++ * Refuse a spawn that declares a restrictive sandbox policy without a
++ * confined argv. Sandbox constraints live in the argv wrapper the shell
++ * executors build through `ctx.sandbox.confine`; without this check a caller
++ * that resolves a `read-only`/`workspace-write` policy but forgets the
++ * confinement would launch an unconstrained child — the exact seam hole of
++ * QVD-2026-52646. The check sits at the execution point (the one place every
++ * spawn must cross), so a policy can never silently degrade to a bare spawn.
++ *
++ * Fail-closed on a policy whose `mode` is absent or unrecognized: only the
++ * literal `danger-full-access` is exempt. A policy object that reached this
++ * point without a usable mode is a caller bug, and treating it as
++ * "unrestricted" is exactly the degradation this guard exists to prevent.
++ * A spawn with no `sandboxPolicy` at all stays unchanged (host-owned).
++ * @param spec - the fully-specified spawn request.
++ * @throws when a policy is declared that is not `danger-full-access` and the argv is not marked confined.
++ */
++export function assertConfinedUnderPolicy(spec: SubprocessSpawnSpec): void {
++  if (spec.sandboxPolicy === undefined) return
++  const mode = spec.sandboxPolicy.mode
++  if (mode === 'danger-full-access') return
++  if (spec.argvConfined === true) return
++  throw new Error(
++    'subprocess: refusing an unconfined spawn under a restricted sandbox policy (mode "'
++    + String(mode) + '"); the argv must be confined by a sandbox backend before reaching the execution point',
++  )
++}
++
+ /**
+  * Validate the synchronous portion of one ordinary spawn request.
+  * @param spec - exact target request.
+@@ -362,6 +390,7 @@ export function validateSubprocessSpec(spec: SubprocessSpawnSpec): void {
+   if (!Number.isFinite(spec.graceMs) || spec.graceMs <= 0 || spec.graceMs > MAX_TIMER_DELAY_MS) {
+     throw new Error(`subprocess graceMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`)
+   }
++  assertConfinedUnderPolicy(spec)
+   if (spec.signal?.aborted) {
+     let reason = 'aborted'
+     try {
+diff --git a/packages/subprocess/subprocess-local/tests/redteam-confined-spawn.spec.ts b/packages/subprocess/subprocess-local/tests/redteam-confined-spawn.spec.ts
+new file mode 100644
+index 0000000..5ebeecb
+--- /dev/null
++++ b/packages/subprocess/subprocess-local/tests/redteam-confined-spawn.spec.ts
+@@ -0,0 +1,83 @@
++/**
++ * Adversarial suite for the confined-spawn guard (QVD-2026-52646).
++ *
++ * The guard's contract: a spawn declaring a restrictive policy must carry
++ * `argvConfined: true`, so sandbox constraints cannot silently evaporate at the
++ * execution point. These cases attack that decision directly — the shapes an
++ * attacker or a careless caller would use to get an unconfined child under a
++ * restrictive policy.
++ *
++ * No process is started here: the guard is a pure predicate, so the suite is
++ * side-effect free by construction.
++ */
++
++import { describe, expect, it } from 'vitest'
++import { assertConfinedUnderPolicy } from '../src/spawn.ts'
++import type { SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
++
++/** A minimal spec carrying only the fields the guard reads. */
++function spec(overrides: Partial<SubprocessSpawnSpec>): SubprocessSpawnSpec {
++  return { argv: ['prog'], graceMs: 1000, ...overrides } as SubprocessSpawnSpec
++}
++
++describe('red team — confined-spawn guard', () => {
++  it('refuses read-only without argvConfined', () => {
++    expect(() => assertConfinedUnderPolicy(spec({ sandboxPolicy: { mode: 'read-only' } })))
++      .toThrow(/refusing an unconfined spawn/)
++  })
++
++  it('refuses workspace-write without argvConfined', () => {
++    expect(() => assertConfinedUnderPolicy(spec({ sandboxPolicy: { mode: 'workspace-write' } })))
++      .toThrow(/refusing an unconfined spawn/)
++  })
++
++  it('allows danger-full-access without argvConfined (unrestricted by definition)', () => {
++    expect(() => assertConfinedUnderPolicy(spec({ sandboxPolicy: { mode: 'danger-full-access' } })))
++      .not.toThrow()
++  })
++
++  it('allows no policy at all (host-owned spawn)', () => {
++    expect(() => assertConfinedUnderPolicy(spec({}))).not.toThrow()
++  })
++
++  it('allows a properly confined restrictive spawn', () => {
++    expect(() => assertConfinedUnderPolicy(spec({
++      sandboxPolicy: { mode: 'read-only' },
++      argvConfined: true,
++    }))).not.toThrow()
++  })
++
++  it.each([
++    ['argvConfined omitted', undefined],
++    ['argvConfined false', false],
++    ['argvConfined 0', 0],
++    ['argvConfined empty string', ''],
++    ['argvConfined null', null],
++  ])('refuses a restrictive policy with %s (no truthy coercion shortcut)', (_label, value) => {
++    // The guard must demand the literal `true`, so a caller cannot satisfy it
++    // with any other truthy-ish value.
++    expect(() => assertConfinedUnderPolicy(spec({
++      sandboxPolicy: { mode: 'read-only' },
++      argvConfined: value as boolean | undefined,
++    }))).toThrow(/refusing an unconfined spawn/)
++  })
++
++  it('refuses an unknown mode string rather than treating it as unrestricted', () => {
++    // A future/typo mode must fail closed: only the literal
++    // `danger-full-access` is exempt.
++    expect(() => assertConfinedUnderPolicy(spec({
++      sandboxPolicy: { mode: 'readonly' } as never,
++    }))).toThrow(/refusing an unconfined spawn/)
++  })
++
++  it('refuses a policy present but mode undefined', () => {
++    expect(() => assertConfinedUnderPolicy(spec({
++      sandboxPolicy: {} as never,
++    }))).toThrow(/refusing an unconfined spawn/)
++  })
++
++  it('names the offending mode in the refusal so the caller can fix it', () => {
++    expect(() => assertConfinedUnderPolicy(spec({ sandboxPolicy: { mode: 'workspace-write' } })))
++      .toThrow(/workspace-write/)
++  })
++})
+diff --git a/packages/subprocess/subprocess/src/types.ts b/packages/subprocess/subprocess/src/types.ts
+index 8f07e05..8e59a6a 100644
+--- a/packages/subprocess/subprocess/src/types.ts
++++ b/packages/subprocess/subprocess/src/types.ts
+@@ -102,6 +102,22 @@ export interface SubprocessSpawnSpec {
+    * tombstone that removes an ordinary ambient entry from the child.
+    */
+   env?: NodeJS.ProcessEnv | undefined
++  /**
++   * Optional declared sandbox policy for this spawn. A spawn under a
++   * restrictive policy (`read-only`/`workspace-write`) is a *confined*
++   * launch: the implementation refuses it unless {@link argvConfined} is
++   * true, so sandbox constraints cannot silently evaporate at the execution
++   * point (QVD-2026-52646). The policy is a structural contract, not the
++   * `@deepseek-ai/dsh-sandbox` type — this seam stays dependency-free.
++   */
++  sandboxPolicy?: { readonly mode: 'read-only' | 'workspace-write' | 'danger-full-access'; readonly workspaceRoot?: string } | undefined
++  /**
++   * True when the caller already confined `argv` through its sandbox backend
++   * (e.g. a `ctx.sandbox.confine`-wrapped argv from the sandboxed shell
++   * executors). Required for any spawn declaring a restrictive
++   * {@link sandboxPolicy}; ignored for `danger-full-access` or no policy.
++   */
++  argvConfined?: boolean | undefined
+ }
+ 
+ /**
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index be1647c..abcf10e 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -1425,6 +1425,9 @@ importers:
+       '@deepseek-ai/dsh-pwsh-sandbox':
+         specifier: workspace:^
+         version: link:../../shell/pwsh-sandbox
++      '@deepseek-ai/dsh-repeat-text-reminder':
++        specifier: workspace:^
++        version: link:../../guard/repeat-text-reminder
+       '@deepseek-ai/dsh-repeat-tool-reminder':
+         specifier: workspace:^
+         version: link:../../guard/repeat-tool-reminder
+@@ -1909,6 +1912,9 @@ importers:
+       '@deepseek-ai/dsh-client-ui-workspace':
+         specifier: workspace:^
+         version: link:../../client/ui-workspace
++      '@deepseek-ai/dsh-client-ui-writing-control':
++        specifier: workspace:^
++        version: link:../../client/ui-writing-control
+       '@deepseek-ai/dsh-cmdline':
+         specifier: workspace:^
+         version: link:../../boot/cmdline
+@@ -1978,6 +1984,9 @@ importers:
+       '@deepseek-ai/dsh-workspace':
+         specifier: workspace:^
+         version: link:../../workspace/workspace
++      '@deepseek-ai/dsh-writing-control':
++        specifier: workspace:^
++        version: link:../../llm/writing-control
+       '@deepseek-ai/schemastery':
+         specifier: link:../../../vendor/schemastery
+         version: link:../../../vendor/schemastery
+@@ -4506,6 +4515,55 @@ importers:
+         specifier: ^18.2.0
+         version: 18.3.1
+ 
++  packages/client/ui-writing-control:
++    dependencies:
++      clsx:
++        specifier: ^2.0.0
++        version: 2.1.1
++    devDependencies:
++      '@deepseek-ai/cordis':
++        specifier: workspace:^
++        version: link:../../../vendor/cordis
++      '@deepseek-ai/dsh-api-remotes':
++        specifier: workspace:^
++        version: link:../../api/remotes
++      '@deepseek-ai/dsh-client-locale':
++        specifier: workspace:^
++        version: link:../locale
++      '@deepseek-ai/dsh-client-store':
++        specifier: workspace:^
++        version: link:../store
++      '@deepseek-ai/dsh-client-ui-layout':
++        specifier: workspace:^
++        version: link:../ui-layout
++      '@deepseek-ai/dsh-client-ui-primitives':
++        specifier: workspace:^
++        version: link:../ui-primitives
++      '@deepseek-ai/dsh-client-ui-renderer':
++        specifier: workspace:^
++        version: link:../ui-renderer
++      '@deepseek-ai/dsh-client-ui-settings':
++        specifier: workspace:^
++        version: link:../ui-settings
++      '@deepseek-ai/dsh-client-ui-settings-plugins':
++        specifier: workspace:^
++        version: link:../ui-settings-plugins
++      '@deepseek-ai/dsh-client-ui-slots':
++        specifier: workspace:^
++        version: link:../ui-slots
++      '@deepseek-ai/dsh-invariants':
++        specifier: workspace:^
++        version: link:../../runtime-diagnostics/invariants
++      '@deepseek-ai/dsh-writing-control':
++        specifier: workspace:^
++        version: link:../../llm/writing-control
++      '@types/react':
++        specifier: ~18.3.1
++        version: 18.3.31
++      react:
++        specifier: ^18.2.0
++        version: 18.3.1
++
+   packages/client/web:
+     devDependencies:
+       '@deepseek-ai/cordis':
+@@ -6400,6 +6458,34 @@ importers:
+         specifier: workspace:^
+         version: link:../../core/tools
+ 
++  packages/guard/repeat-text-reminder:
++    dependencies:
++      '@deepseek-ai/schemastery':
++        specifier: link:../../../vendor/schemastery
++        version: link:../../../vendor/schemastery
++    devDependencies:
++      '@deepseek-ai/cordis':
++        specifier: workspace:^
++        version: link:../../../vendor/cordis
++      '@deepseek-ai/dsh-agent':
++        specifier: workspace:^
++        version: link:../../core/agent
++      '@deepseek-ai/dsh-agent-loop':
++        specifier: workspace:^
++        version: link:../../core/agent-loop
++      '@deepseek-ai/dsh-agent-loop-testkit':
++        specifier: workspace:^
++        version: link:../../test-support/agent-loop-testkit
++      '@deepseek-ai/dsh-llm':
++        specifier: workspace:^
++        version: link:../../llm/llm
++      '@deepseek-ai/dsh-session':
++        specifier: workspace:^
++        version: link:../../core/session
++      '@deepseek-ai/dsh-session-projection':
++        specifier: workspace:^
++        version: link:../../session/session-projection
++
+   packages/guard/repeat-tool-reminder:
+     dependencies:
+       '@deepseek-ai/schemastery':
+@@ -7252,6 +7338,31 @@ importers:
+         specifier: workspace:^
+         version: link:../../session/session-projection
+ 
++  packages/llm/writing-control:
++    dependencies:
++      '@deepseek-ai/schemastery':
++        specifier: link:../../../vendor/schemastery
++        version: link:../../../vendor/schemastery
++    devDependencies:
++      '@deepseek-ai/cordis':
++        specifier: workspace:^
++        version: link:../../../vendor/cordis
++      '@deepseek-ai/dsh-agent':
++        specifier: workspace:^
++        version: link:../../core/agent
++      '@deepseek-ai/dsh-invariants':
++        specifier: workspace:^
++        version: link:../../runtime-diagnostics/invariants
++      '@deepseek-ai/dsh-llm':
++        specifier: workspace:^
++        version: link:../llm
++      '@deepseek-ai/dsh-settings':
++        specifier: workspace:^
++        version: link:../../settings/settings
++      '@deepseek-ai/dsh-system-prompt':
++        specifier: workspace:^
++        version: link:../../core/system-prompt
++
+   packages/lsp/lsp:
+     devDependencies:
+       '@deepseek-ai/cordis':
+diff --git a/tsconfig.base.json b/tsconfig.base.json
+index 83cabd9..59c11d1 100644
+--- a/tsconfig.base.json
++++ b/tsconfig.base.json
+@@ -28,6 +28,13 @@
+     // not declaration path aliases, keep each package/vendor source compiled
+     // under its own tsconfig boundary.
+     "paths": {
++      // Hand-written aliases: these packages declare a name that differs from
++      // their directory, so gen-tsconfig-paths cannot derive them.
++      "@deepseek-ai/dsh-writing-control": ["./packages/llm/writing-control/src"],
++      "@deepseek-ai/dsh-writing-control/invariant": ["./packages/llm/writing-control/src/invariant.ts"],
++      "@deepseek-ai/dsh-client-ui-writing-control": ["./packages/client/ui-writing-control/src"],
++      "@deepseek-ai/dsh-client-ui-writing-control/invariant": ["./packages/client/ui-writing-control/src/invariant.ts"],
++
+       "@deepseek-ai/cordis": ["./vendor/cordis/src"],
+       "@deepseek-ai/cosmokit": ["./vendor/cosmokit/src"],
+       "@deepseek-ai/schemastery": ["./vendor/schemastery/src"],
+@@ -336,6 +343,7 @@
+       "@deepseek-ai/dsh-plan-mode/invariant": ["./packages/plan/plan-mode/src/invariant.ts"],
+       "@deepseek-ai/dsh-plugin-package-inventory-deepseek": ["./packages/llm/plugin-package-inventory-deepseek/src"],
+       "@deepseek-ai/dsh-pwsh-sandbox": ["./packages/shell/pwsh-sandbox/src"],
++      "@deepseek-ai/dsh-repeat-text-reminder": ["./packages/guard/repeat-text-reminder/src"],
+       "@deepseek-ai/dsh-repeat-tool-reminder": ["./packages/guard/repeat-tool-reminder/src"],
+       "@deepseek-ai/dsh-sandbox": ["./packages/sandbox/sandbox/src"],
+       "@deepseek-ai/dsh-sandbox-local": ["./packages/sandbox/sandbox-local/src"],
+diff --git a/tsconfig.client.json b/tsconfig.client.json
+index 8ffb941..90a7647 100644
+--- a/tsconfig.client.json
++++ b/tsconfig.client.json
+@@ -100,6 +100,7 @@
+     { "path": "./packages/client/ui-plan" },
+     { "path": "./packages/client/ui-settings-plugins" },
+     { "path": "./packages/client/ui-user-questions" },
++    { "path": "./packages/client/ui-writing-control" },
+     { "path": "./packages/client/ui-trajectory" },
+     { "path": "./packages/session-query/session-log-export/tsconfig.client.json" },
+     { "path": "./packages/client/ui-open-in-app" },
+diff --git a/tsconfig.host.json b/tsconfig.host.json
+index c5a3f11..9331dad 100644
+--- a/tsconfig.host.json
++++ b/tsconfig.host.json
+@@ -213,6 +213,7 @@
+     { "path": "./packages/core/system-prompt" },
+     { "path": "./packages/core/agent" },
+     { "path": "./packages/core/agent-default-model" },
++    { "path": "./packages/llm/writing-control" },
+     { "path": "./packages/interaction/commands" },
+     { "path": "./packages/goal/goal" },
+     { "path": "./packages/goal/tool-goal" },
+@@ -336,6 +337,7 @@
+     { "path": "./packages/preset/agent-presets" },
+     { "path": "./packages/preset/persona" },
+     { "path": "./packages/guard/repeat-tool-reminder" },
++    { "path": "./packages/guard/repeat-text-reminder" },
+     { "path": "./packages/extensions/cordis-host-runner" },
+     { "path": "./packages/extensions/tool-cordis" },
+     { "path": "./packages/hooks/hook-protocol" },
+diff --git a/vendor/README.md b/vendor/README.md
+index 4cfbe89..e88da11 100644
+--- a/vendor/README.md
++++ b/vendor/README.md
+@@ -49,6 +49,8 @@ Keep this log exhaustive — every divergence from upstream must be listed.
+ 17. **`@deepseek-ai` rescope**: every vendored manifest `name`, every internal dependency entry among the vendored set, and every module specifier that reaches them use the scoped names in the manifest table's `npm name` column. Directory names, version numbers, and dependency ranges are unchanged, and no upstream runtime identifier is renamed — `Symbol.for('schemastery')` and Schemastery's `vendor:` metadata field keep their upstream values. Re-apply with `pnpm run rescope-vendor --apply` after a sync; the table's two name columns are the mapping, restated for consumers in [docs/rescope.md](../docs/rescope.md).
+ 18. **Entry `disabled` interpolation in `loader/src/config/entry.ts`**: a `disabled: !!js` expression evaluates against the loader context at every mount decision; the raw node stays in the options, so write-back keeps the `!!js` form. `disabled` is the only interpolated metadata field. Covered by `packages/boot/app-boot/tests/user-patches.spec.ts` and `apps/cli/tests/windows-shell.spec.ts`.
+ 19. **`loader/src/internal.ts` runtime shape detection**: `ModuleLoader.fromInternal()` classifies the internal loader by which module-job API it owns — `getOrCreateModuleJob` for v2, `getModuleJobForImport` for v1 — instead of by Node major version. Upstream tags every major `>= 24` as v2, but the v2 interface arrived in Node 24.12.0, so 24.0–24.11.1 report major 24 while still carrying the v1 loader; consumers then called `resolveSync` with reversed parameters and every call threw. `dsh web` served an empty client graph (`__DSH_BOOT__.entries: []`) and HMR partial reload resolved no entry URL, both behind swallowed or warn-level errors. Arity cannot discriminate the two shapes, because each reports `resolveSync.length === 2`. A loader owning neither API is left unclassified rather than guessed, so consumers take their documented no-internals path. Covered on the `node-compat` Node version matrix, which pins 24.9 for the mistagged range.
++20. **`loader/src/config/utils.ts` vm-isolated `!!js` evaluation (QVD-2026-52631)**: the upstream `evaluate` (`new Function('ctx','expr','with(ctx){return eval(expr)}')`) lets a `!!js` expression fall through the loader context to the host global scope, where `process` and `process.getBuiltinModule()` provide arbitrary code execution at config-load time. It now evaluates each expression in a fresh `node:vm` context that contains no host object: the loader context's data chain is JSON-projected across the vm boundary, and `process` (read-only `env` snapshot, `platform`, `execPath`, `cwd`, `getBuiltinModule` limited to `node:url`), `dshHomePath`, and the minimal file-URL `URL`/`fileURLToPath` helpers are rebuilt inside the vm realm, so host reach via direct identifiers and via `Function`-constructor chains is gone while the shipped expression vocabulary keeps working. `interpolate`/`isJsExpr`/`JsExpr` are unchanged. The data projection drops function-valued context members and accessor-only properties; an expression that referenced one now fails loud instead of reaching the host.
++
+ 
+ ## Sync procedure
+ 
+diff --git a/vendor/loader/src/config/utils.ts b/vendor/loader/src/config/utils.ts
+index cd706c0..d8fed77 100644
+--- a/vendor/loader/src/config/utils.ts
++++ b/vendor/loader/src/config/utils.ts
+@@ -1,12 +1,271 @@
++/**
++ * Namespace imports (never named imports) for the Node builtins this module
++ * needs at evaluation time. The vendored loader is also bundled into the
++ * browser application, where Vite externalizes `node:*` modules; a named
++ * import (`import { join } from 'node:path'`) makes the browser build fail
++ * with "not exported by __vite-browser-external", while namespace access
++ * compiles everywhere and only touches the real modules when evaluation
++ * actually runs on a Node host. Config expression evaluation is a host-only
++ * path; the browser never reaches it.
++ */
++import * as nodeOs from 'node:os'
++import * as nodePath from 'node:path'
++import * as nodeVm from 'node:vm'
+ import { valueMap } from '@deepseek-ai/cosmokit'
+ 
+-// eslint-disable-next-line no-new-func
+-/** Evaluate a JavaScript expression against a loader context scope. */
+-export const evaluate = new Function('ctx', 'expr', `
+-  with (ctx) {
+-    return eval(expr)
++/**
++ * Loader `!!js` expression evaluation, isolated from the host realm.
++ *
++ * A configuration expression is attacker-influenceable content (a patch file
++ * a compromised agent or a cloned repository can place), so it must never
++ * evaluate with reach to the Node host: `with (ctx) { eval(expr) }` inside a
++ * `new Function` falls through `ctx` to the host global scope, where
++ * `process` and — on Node 22.3+ — `process.getBuiltinModule()` turn one
++ * `!!js` scalar into arbitrary code execution at load time
++ * (QVD-2026-52631).
++ *
++ * Expressions now run inside a fresh `node:vm` context that contains no host
++ * object: a JSON-safe projection of the loader context's data chain plus
++ * vm-local helpers built from plain data. Inside the vm realm the `Function`
++ * constructor creates functions bound to the vm global, which has no host
++ * `process`, so neither direct identifiers nor constructor-chain escapes
++ * reach the host. ECMAScript intrinsics (`JSON`, `Math`, `Number`, `String`,
++ * `decodeURIComponent`, …) remain available, which covers the shipped
++ * expression vocabulary (`process.env` / `process.cwd()` /
++ * `process.platform` / `process.execPath` / `dshHomePath` / file-URL
++ * resolution).
++ */
++
++/** Data-only copy of one value: primitives and JSON-plain containers pass; anything else is dropped. */
++function projectData(value: unknown, depth = 0): unknown {
++  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
++  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
++  if (typeof value === 'bigint' || typeof value === 'symbol' || typeof value === 'function') return undefined
++  if (typeof value !== 'object' || depth > 24) return undefined
++  if (Array.isArray(value)) {
++    const output: unknown[] = []
++    for (const item of value) {
++      const projected = projectData(item, depth + 1)
++      if (projected !== undefined || item === null) output.push(projected)
++    }
++    return output
++  }
++  const prototype: unknown = Object.getPrototypeOf(value)
++  if (prototype !== null && prototype !== Object.prototype) return undefined
++  const output: Record<string, unknown> = {}
++  for (const key of Object.keys(value)) output[key] = projectData((value as Record<string, unknown>)[key], depth + 1)
++  return output
++}
++
++/**
++ * Walk one context's prototype chain (Cordis scopes link through prototypes)
++ * and project the nearest own string-keyed DATA properties into a plain
++ * record. Functions, classes, accessors, and service instances never cross —
++ * they are exactly the handles a same-realm evaluator could climb to the
++ * host. The nearest definition wins, mirroring identifier resolution through
++ * `with (ctx)`.
++ *
++ * `ctx.provide(name, value)` values (the `webStartup`/`headlessStartup`-style
++ * objects config expressions read) live in the root fiber's provider store,
++ * not as own properties, so the store is enumerated in addition to the chain
++ * walk; only plain-data values are projected. Everything is read through
++ * optional access and per-entry try/catch so an unavailable store or a
++ * throwing provider never aborts evaluation.
++ * @param ctx - the loader (entry) context an expression evaluates against.
++ * @returns the data-only view exposed to vm-realm expressions.
++ */
++function projectContext(ctx: object): Record<string, unknown> {
++  const output: Record<string, unknown> = {}
++  const seen = new Set<string>()
++  const adopt = (name: string, value: unknown): void => {
++    if (seen.has(name)) return
++    const projected = projectData(value)
++    if (projected !== undefined) {
++      seen.add(name)
++      output[name] = projected
++    }
++  }
++  let current: object | null = ctx
++  while (current !== null && current !== Object.prototype) {
++    for (const name of Object.getOwnPropertyNames(current)) {
++      if (seen.has(name) || name === '__proto__' || name === 'constructor') continue
++      const descriptor = Object.getOwnPropertyDescriptor(current, name)
++      if (descriptor === undefined || !('value' in descriptor)) continue
++      seen.add(name)
++      const projected = projectData(descriptor.value)
++      if (projected !== undefined) output[name] = projected
++    }
++    current = Object.getPrototypeOf(current)
++  }
++  // Cordis `ctx.provide` stores provider implementations on the owning
++  // fiber's store, keyed by an isolation symbol — the values config
++  // expressions read (webStartup, headlessStartup, …) live there. The root
++  // fiber's store is the one a composition seeds before the Loader mounts;
++  // sibling entry fibers (a provider row mounted next to a consumer row whose
++  // config is being interpolated) register on their OWN fiber's store, so the
++  // whole live fiber tree is scanned as a lower-priority fallback. Only
++  // plain-data values are projected; functions, classes, and service
++  // instances never cross.
++  try {
++    const root = (ctx as { root?: unknown }).root ?? ctx
++    const fiber = (root as { fiber?: { store?: Record<string, unknown> } }).fiber
++    const store = fiber?.store
++    if (store !== undefined && typeof store === 'object') {
++      for (const name of Object.keys(store)) {
++        if (seen.has(name) || name === '__proto__' || name === 'constructor') continue
++        const impl = (store as Record<string, { value?: unknown } | unknown>)[name]
++        const value = typeof impl === 'object' && impl !== null && 'value' in impl
++          ? (impl as { value?: unknown }).value
++          : undefined
++        adopt(name, value)
++      }
++    }
++    // Whole-tree fallback: every active fiber's provider store, so a provider
++    // entry in the same tree as the consumer is visible to its expressions.
++    const registry = (root as { registry?: { values?: () => Iterable<{ fibers?: Iterable<{ store?: Record<string, unknown> }> }> } }).registry
++    const runtimes = registry?.values === undefined ? [] : [...registry.values()]
++    for (const runtime of runtimes) {
++      for (const rowFiber of runtime.fibers ?? []) {
++        const rowStore = rowFiber.store
++        if (rowStore === undefined || typeof rowStore !== 'object') continue
++        for (const name of Object.keys(rowStore)) {
++          if (seen.has(name) || name === '__proto__' || name === 'constructor') continue
++          const impl = (rowStore as Record<string, { value?: unknown } | unknown>)[name]
++          const value = typeof impl === 'object' && impl !== null && 'value' in impl
++            ? (impl as { value?: unknown }).value
++            : undefined
++          adopt(name, value)
++        }
++      }
++    }
++  } catch {
++    // A provider store is an optimization, never a boot prerequisite.
++  }
++  return output
++}
++
++/** Resolve the effective Harness home the same way `dshHomePath` does: `$DSH_HOME` else `~/.dsh`. */
++function harnessHomeBase(): string {
++  const fromEnv = process.env.DSH_HOME
++  const selected = fromEnv !== undefined && fromEnv.trim().length > 0 ? fromEnv : nodePath.join(nodeOs.homedir(), '.dsh')
++  const expanded = selected === '~'
++    ? nodeOs.homedir()
++    : selected.startsWith('~/') || selected.startsWith('~\\') ? nodePath.join(nodeOs.homedir(), selected.slice(2)) : selected
++  return nodePath.resolve(expanded)
++}
++
++/**
++ * vm-realm prelude: rebuilds every context value INSIDE the vm so no host
++ * object (whose constructor chains reach the host `Function`) is ever
++ * reachable from an expression. Context data arrives as one JSON string and
++ * is parsed in this realm; the process facade, `dshHomePath`, and the
++ * minimal file-URL `URL`/`fileURLToPath` helpers are all defined here from
++ * plain data, then the injected carrier is removed.
++ */
++const VM_PRELUDE = `
++(() => {
++  const carrier = globalThis.__dsh
++  delete globalThis.__dsh
++  const data = JSON.parse(carrier.dataJson)
++  for (const key of Object.keys(data)) globalThis[key] = data[key]
++  const ctx = data
++  // Legacy loader expressions may look services up through ctx.get(name).
++  // Back it with a data-only resolver over the projected view: it answers
++  // provided values (and undefined for anything else) without ever touching
++  // a live host service.
++  ctx.get = (name) => (Object.prototype.hasOwnProperty.call(ctx, name) ? ctx[name] : undefined)
++  globalThis.ctx = ctx
++  const sepChar = carrier.sep
++  const joinSegments = (base, segs) => {
++    let out = base
++    for (const seg of segs) {
++      if (!seg) continue
++      const last = out.charCodeAt(out.length - 1)
++      const hasSep = last === 47 || last === 92
++      out = hasSep ? out + seg : out + sepChar + seg
++    }
++    return out
++  }
++  globalThis.dshHomePath = (...segs) => joinSegments(ctx.dshHomeBase, segs)
++  const decodePathname = (pathname) => {
++    try { return decodeURIComponent(pathname) } catch { return pathname }
++  }
++  const fileURLToPath = (url) => {
++    const href = typeof url === 'string'
++      ? url
++      : url !== null && typeof url === 'object' && typeof url.href === 'string' ? url.href : ''
++    if (typeof href !== 'string' || !href.startsWith('file://')) {
++      throw new Error('config expression: fileURLToPath supports file:// URLs only')
++    }
++    let path = href.slice('file://'.length)
++    path = path.replace(/^localhost\\//i, '/')
++    if (/^\\/[A-Za-z]:\\//.test(path)) path = path.slice(1)
++    return decodePathname(path)
++  }
++  class URL {
++    constructor(input, base) {
++      if (typeof input !== 'string') throw new TypeError('config expression: URL input must be a string')
++      const absolute = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(input)
++      this.href = absolute || base === undefined || base === null ? String(input) : String(base) + input
++      this.pathname = this.href
++    }
+   }
+-`) as ((ctx: object, expr: string) => any)
++  globalThis.URL = URL
++  globalThis.fileURLToPath = fileURLToPath
++  const env = {}
++  for (const key of Object.keys(carrier.env)) env[key] = carrier.env[key]
++  globalThis.process = {
++    env: Object.freeze(env),
++    platform: carrier.platform,
++    arch: carrier.arch,
++    version: carrier.version,
++    execPath: carrier.execPath,
++    cwd: () => carrier.cwd,
++    getBuiltinModule(name) {
++      if (name === 'node:url') return { fileURLToPath }
++      throw new Error('config expression: process.getBuiltinModule(' + JSON.stringify(name)
++        + ') is not available; only node:url is exposed')
++    },
++  }
++})()
++`
++
++/**
++ * Evaluate a JavaScript expression against a loader context scope.
++ *
++ * Every evaluation builds a fresh vm context whose values are reconstructed
++ * inside the vm realm (context data crosses as one JSON string), so no host
++ * object — and therefore no host `process`/`Function` — is reachable from
++ * the expression. A runaway expression is bounded by the synchronous vm
++ * timeout.
++ * @param ctx - the loader (entry) context the expression resolves against.
++ * @param expr - the `!!js` expression text.
++ * @returns the evaluated value.
++ */
++export function evaluate(ctx: object, expr: string): any {
++  const projection = projectContext(ctx)
++  const dataJson = JSON.stringify({
++    ...projection,
++    // Always present regardless of the composition: the home base the
++    // `dshHomePath` helper resolves against.
++    dshHomeBase: harnessHomeBase(),
++  })
++  const sandbox: Record<string, unknown> = {
++    __dsh: {
++      dataJson,
++      env: process.env,
++      platform: process.platform,
++      arch: process.arch,
++      version: process.version,
++      execPath: process.execPath,
++      cwd: process.cwd(),
++      sep: nodePath.sep,
++    },
++  }
++  const context = nodeVm.createContext(sandbox)
++  nodeVm.runInContext(VM_PRELUDE, context, { timeout: 1_000 })
++  return nodeVm.runInContext(expr, context, { timeout: 1_000 })
++}
+ 
+ /** Recursively replace YAML `!js` expression nodes with evaluated values. */
+ export function interpolate(ctx: object, value: any) {

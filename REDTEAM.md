@@ -1,5 +1,7 @@
 # Red Team Report — DSH QVD 补丁对抗测试
 
+> **关于文中出现的 `qvd-2026-*.patch`**：5 个分项补丁已于 2026-09-23 并入 `fixes-0.1.5-rc.2.patch` 并从仓库移除；文中引用保留作审计记录。
+
 > 本文件记录**主动攻击自己的补丁**的结果。目标不是证明"补丁看起来没问题"，而是用可复核的证据说明**哪些攻击被阻断、哪些仍然成功**。
 
 ## 测试环境
@@ -7,7 +9,7 @@
 | 项目 | 值 |
 |---|---|
 | 目标 | DeepSeek Harness `0.1.5-rc.2`（本地检出 `D:\deepseek-harness-master\dsh-0.1.5-rc.2`） |
-| 补丁 | 本仓库 `fixes.patch` + 四个补充补丁 |
+| 补丁 | 本仓库 `fixes.patch` + **五个**补充补丁（2026-09-23 起 0.1.5-rc.2 亦可用单一补丁 `fixes-0.1.5-rc.2.patch`） |
 | 平台 | Windows 11 x64，Node v24.20.0，非管理员账户 |
 | 隔离方式 | 每个用例使用 `mkdtemp` 临时目录；workspace 与 outside 为同级目录；canary 为测试专用文件 |
 | 外部副作用 | **无**。不联网、不触碰真实账号/服务器/数据；subprocess 守卫测试为纯谓词，不启动任何进程 |
@@ -29,7 +31,9 @@
 ## 一、读栅栏（QVD-2026-52632）
 
 测试文件：`packages/fs/fs-sandbox/tests/redteam-read-fence.spec.ts`
-结果：**16 通过 / 0 失败**
+结果：**16 个用例全部按预期通过**（实际分布：**14 Blocked / 1 Bypassed / 1 Current Behavior**，见下表）。
+
+> 口径说明："通过"指**用例断言与当前行为一致**，**不等于** 16 次攻击都被阻断 —— 其中 1 次是已承认的绕过（硬链接），1 次是记录现状（`danger-full-access` 语义即无限制）。
 
 Canary 为 workspace 外同级目录中的 `CANARY-8f3a2b-do-not-exfiltrate`。
 

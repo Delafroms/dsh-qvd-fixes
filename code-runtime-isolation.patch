@@ -1,0 +1,74 @@
+diff --git a/packages/code-runtime/code-runtime-worker-thread/src/bootstrap.ts b/packages/code-runtime/code-runtime-worker-thread/src/bootstrap.ts
+index 45116d3..87bff29 100644
+--- a/packages/code-runtime/code-runtime-worker-thread/src/bootstrap.ts
++++ b/packages/code-runtime/code-runtime-worker-thread/src/bootstrap.ts
+@@ -6,6 +6,7 @@
+  */
+ 
+ import { inspect } from 'node:util'
++import { createContext, Script } from 'node:vm'
+ import type { DoneMessage, ReplyMessage, WorkerBootData, WorkerToHost } from './protocol.ts'
+ import { jsonStringBytesUpTo, jsonValueBytesUpTo, truncateJsonStringBytes } from './output-json.ts'
+ import { decodeWorkerJson, encodeWorkerJson, snapshotCodeJsonValue } from './worker-json.ts'
+@@ -228,6 +229,19 @@ export function prepareException(
+   return prepareFailure('exception', message, remainingOutputBytes, maxOutputBytes)
+ }
+ 
++/**
++ * Wrap one host function so the program can call it without climbing back into
++ * the host realm: `Function.prototype` is unreachable from a null prototype,
++ * so `wrapper.constructor` cannot produce host code.
++ * @param impl - the host function to expose.
++ * @returns a callable whose prototype chain is empty.
++ */
++function detachedHostFunction(impl: (...args: never[]) => unknown): (...args: never[]) => unknown {
++  const wrapper = (...args: never[]): unknown => impl(...args)
++  Object.setPrototypeOf(wrapper, null)
++  return wrapper
++}
++
+ /** One awaited binding call's settlement handles, keyed by call id in the pending map. */
+ export interface PendingCall {
+   resolve(value: unknown): void
+@@ -399,17 +413,30 @@ export async function runWorkerMain(
+ 
+   let done: DoneMessage
+   try {
+-    // The async function constructor, reached through an instance because
+-    // `AsyncFunction` is not a global. The program body is strict-mode.
+-    /* v8 ignore next -- the arrow exists only to reach the AsyncFunction constructor; it is never invoked. */
+-    const AsyncFunction = (async () => {}).constructor as new (...args: string[]) => (...fnArgs: unknown[]) => Promise<unknown>
+-    const fn = new AsyncFunction(
+-      ...data.namespaces.map(namespace => namespace.global),
+-      ...errorClassParameters,
+-      'console',
+-      `'use strict';\n${data.code}`,
+-    )
+-    const value = await fn(...namespaces, ...errorClassValues, consoleShim)
++    // The program body runs inside a fresh `node:vm` realm whose global carries
++    // only the declared bindings and the console shim. Compiling with
++    // `vm.Script` — not the async-function constructor — is what closes the
++    // ambient host surface: a Function-constructor body resolves `import()`
++    // against the host realm, so string code generation is disabled here too.
++    // Dynamic `import` finds no `importModuleDynamically` callback and rejects.
++    const sandbox: Record<string, unknown> = Object.create(null) as Record<string, unknown>
++    for (const [index, namespace] of data.namespaces.entries()) sandbox[namespace.global] = namespaces[index]
++    for (const [index, name] of errorClassParameters.entries()) sandbox[name] = errorClassValues[index]
++    sandbox.console = consoleShim
++    // Timers stay callable — a program legitimately awaits one — but only as
++    // null-prototype wrappers: a bare injected host function would hand the
++    // program the host realm back through `fn.constructor`.
++    sandbox.setTimeout = detachedHostFunction(setTimeout)
++    sandbox.clearTimeout = detachedHostFunction(clearTimeout)
++    sandbox.setInterval = detachedHostFunction(setInterval)
++    sandbox.clearInterval = detachedHostFunction(clearInterval)
++    sandbox.queueMicrotask = detachedHostFunction(queueMicrotask)
++    const context = createContext(sandbox, {
++      name: 'run_code',
++      codeGeneration: { strings: false, wasm: false },
++    })
++    const script = new Script(`(async () => {\n'use strict';\n${data.code}\n})()`, { filename: 'run_code' })
++    const value = await script.runInContext(context)
+     done = {
+       type: 'done',
+       ...prepareCompletion(value, logs.remainingOutputBytes(), data.maxOutputBytes),

@@ -3,6 +3,16 @@
 > 定位：本补丁是**针对 0.1.2-alpha.2 的社区补丁**——4 个漏洞（52631 / 52632 / 52644 / 52646）有源码修改；57410 为该基线内已有修复的版本核验，未做改动。非官方安全更新，也非完整安全审计。
 >
 > **另有针对 0.1.5-rc.2 的补充补丁**（`qvd-2026-57410-transport-fence.patch`、`qvd-2026-52632-editor-read-fence.patch`、`qvd-2026-52632-plugin-fs-fence.patch`、`qvd-2026-52646-confined-spawn-fail-closed.patch`、`guard-repeat-text-reminder.patch`），见文末[「0.1.5-rc.2 补充补丁」](#015-rc2-补充补丁2026-09-18)。
+> **2026-09-23：这 5 个分项补丁已并入 `fixes-0.1.5-rc.2.patch` 并从仓库移除**，下文的逐项说明保留作审计记录。
+>
+> **🆕 2026-09-23 更新：新增 `fixes-0.1.5-rc.2.patch`（0.1.5-rc.2 一键补丁）。**
+> 它把基线 + 5 个补充补丁的最终效果合并成**单一自洽 diff**（48 文件，+2114 / −74），在干净 0.1.5-rc.2 上 `git apply --check` 通过。
+> **0.1.5-rc.2 用户请优先用它**，不要再走「基线 → 补充补丁」的分步流程。
+> 同时，**5 个分项补丁已并入该单一补丁并从仓库移除**；下文对它们的设计说明保留作审计记录（内容无丢失）。
+>
+> **⚠️ 2026-09-23 更正：`fixes.patch` 在干净的 0.1.5-rc.2 上打不上。**
+> 实测 5 个文件报 `patch does not apply`（`fs/fs/src/index.ts`、`tool-fs/src/read.ts`、`tool-fs/src/read-image.ts`、`subprocess-local/src/spawn.ts` 及其测试）。
+> 原因是 0.1.2 → 0.1.5 上游改了这些文件；**不是行尾问题**（`--ignore-whitespace`、`-C1` 均无效）。此前「在 0.1.5-rc.2 上必须按序应用基线 → 补充补丁」的说明与事实不符。
 >
 > **⚠️ 两组补丁目标版本不同，不能互相替代，也不能合并。**
 > `fixes.patch` 相对 **0.1.2-alpha.2** 生成；补充补丁针对 **0.1.5-rc.2**。把 0.1.5 的内容并进 `fixes.patch` 会让它在 0.1.2 上应用不了。
@@ -281,3 +291,77 @@ git apply       qvd-2026-52632-editor-read-fence.patch
 ```
 
 两个补丁互不重叠，可独立应用。补丁以 LF 生成；Windows 检出若为 CRLF 导致 `does not apply`，加 `--ignore-whitespace` 重试。
+
+---
+
+# 0.1.5-rc.2 一键补丁与零日修复（2026-09-23）
+
+## 1. `fixes-0.1.5-rc.2.patch` —— 单一完整补丁
+
+| 项 | 值 |
+|---|---|
+| 目标版本 | **0.1.5-rc.2**（干净检出） |
+| 规模 | 48 文件，+2114 / −74 |
+| SHA-256 | `9A2FA061BE21B3BE4CFB98CD3F7ACCA0741C4DDBF71EF1503D6FF06BB9A4ABF5` |
+| 内容 | 基线（52631 / 52632 / 52644 / 52646）+ 5 个补充补丁的**最终效果** |
+| 验证 | 全新 `git archive` 干净树 `git apply --check` → exit 0；应用后 `checkedReadTarget` 等修复标记在位 |
+
+**为什么需要它**：`fixes.patch` 相对 0.1.2-alpha.2 生成，在 0.1.5-rc.2 上有 5 个文件打不上（见文首更正）。
+把它与补充补丁"合并"并不可行 —— 两者锚定不同版本的上下文，且都定义 `assertConfinedUnderPolicy`（基线是 fail-open 旧版、补充补丁 4 是覆盖版），放进同一个 diff 会冲突或产生重复声明。
+**因此改为按最终效果重新生成单一 diff**，等价且自洽。
+
+**副作用（正向）**：单一补丁里只有 fail-closed 版本，**不会**再出现「只打了基线、装上一个带 fail-open 缺陷的守卫」这种事故。
+
+## 2. `code-runtime-isolation.patch` —— `run_code` 代码运行时隔离缺口
+
+> **状态：未上报上游、未定级。** 本节不含可直接复现的攻击步骤。
+
+| 项 | 值 |
+|---|---|
+| 目标文件 | `packages/code-runtime/code-runtime-worker-thread/src/bootstrap.ts` |
+| 规模 | 1 文件，+38 / −11 |
+| SHA-256 | `C85FC4E4318B638F8F6D83FFCF67B60CE21661E76032342865AEA32945E59C66` |
+
+**问题**：该运行时把模型代码交给 worker 的**全局作用域**执行（`(async () => {}).constructor`），
+且**完全不接收会话沙箱策略**（`packages/code-runtime` 内 `sandboxPolicy` 零引用）。
+worker 只做了两件事：`env: {}` 与 `execArgv: []` —— 都不构成边界。
+
+**实测对照（同一会话、同一 `workspace-write` 策略）**：
+
+| 通道 | 工作区外读 / 写 |
+|---|---|
+| `read` / `write` 工具 | **被拒**（`[sandbox: file access denied under workspace-write mode]`） |
+| `pwsh` 子进程 | **被拒**（`Access to the path is denied`） |
+| `run_code` | **成功**（读工作区外 canary、写入工作区外文件、读取凭据文件） |
+
+**修复**：
+- 程序体改在 `node:vm` 上下文中执行（`createContext` + `vm.Script`，包成 async IIFE）；
+- 上下文只挂载声明的绑定与 console 垫片；
+- `codeGeneration: { strings: false, wasm: false }` —— 连 vm 内部的 `Function` 构造器与 `eval` 一起关掉；
+- **不提供** `importModuleDynamically` 回调 —— 动态 `import` 直接 reject；
+- 定时器以 **null-prototype 包装**注入（宿主函数直接注入会经 `.constructor` 把宿主 realm 交回去）。
+
+**两个实现陷阱（实测踩到，务必保留）**：
+1. 用 **vm realm 的 `AsyncFunction` 不管用** —— Function 构造器创建的函数会把 `import()` 解析到宿主 realm，实测仍能导入 `node:fs`。**必须用 `vm.Script` 直接编译程序体。**
+2. 注入宿主函数会重新开洞 —— `setTimeout.constructor` 就是宿主 realm 的 Function 构造器。
+
+**验证结果（直接驱动 `bootstrap.ts`，8 项）**：
+
+| 用例 | 结果 |
+|---|---|
+| `await import('node:fs')` | 🚫 `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING` |
+| `typeof process` / `fetch` / `require` | 全部 `undefined` |
+| `(function(){}).constructor('return 1')` | 🚫 `EvalError` |
+| `eval('1+1')` | 🚫 `EvalError` |
+| `setTimeout.constructor('return typeof process')` | 🚫 `TypeError`（原型为 `null`） |
+| `setTimeout` / `queueMicrotask` | ✅ 可用 |
+| 返回对象 / 数组（跨 realm JSON） | ✅ 正常 |
+| 绑定调用 / console 捕获 / 异常路径 | ✅ 正常 |
+
+**已知边界（如实记录）**：
+- 跨 realm 的异常**丢失堆栈**，只保留 message（`prepareException` 的 `instanceof` 在跨 realm 时为假）；
+- `vitest` 全量回归**未在本机跑通** —— 沙箱下 vite 的管道 `exec` 报 `spawn EPERM`（文档化的沙箱边界），
+  故改用**直接驱动 `bootstrap.ts`** 的针对性脚本验证（Node 24 原生类型剥离）；
+- 未验证 read-only 会话下 `run_code` 工具是否仍可见。
+
+**披露建议**：先交上游审核，再决定是否公开分发。`apply-dsh-fixes.bat` 对它是**单独的二次确认**，默认不应用。

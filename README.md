@@ -10,6 +10,18 @@
 | Partially-fixed（部分修复） | QVD-2026-57410 |
 | 对抗验证 | 33 个红队用例（3 个套件） |
 
+## 30 秒版
+
+| 问题 | 答案 |
+|---|---|
+| 这是什么 | DeepSeek Harness 公开漏洞的**社区补丁 + 对抗测试 + 验证脚本**。非官方，非完整审计 |
+| 我该用哪个 | **0.1.5-rc.2 → `fixes-0.1.5-rc.2.patch`（单一补丁，一条命令）**；0.1.2-alpha.2 → `fixes.patch` |
+| 怎么装 | 跑 `apply-dsh-fixes.bat`（先 `--check` 预检、再询问、后写入），或手动 `git apply --check` → `git apply` |
+| 装完怎么验 | 跑 `verify-dsh-fixes.bat`（只读、不联网），再用 `-tests` 跑回归 |
+| 修了什么 | 52631 / 52632 / 52644 / 52646 四个漏洞有源码修复；57410 由上游 token 部分修复，本仓库补 TCP peer 判据 |
+| 还有什么没修 | 硬链接绕过、进程级沙箱读面、52631 的 env 全量投影 —— 见 [REDTEAM.md](./REDTEAM.md)「已知绕过汇总」 |
+| 我不该期待什么 | 它**不解决间接提示注入**，也**不保证没有其它未发现的问题**；升级官方版本前请先看 [FIXES.md](./FIXES.md) |
+
 本仓库提供针对 DeepSeek Harness 公开披露漏洞的**社区补丁**、**对抗测试**与验证脚本。
 
 - **基线补丁**（`fixes.patch`）基于上游 **0.1.2-alpha.2**，修复 52631 / 52632 / 52644 / 52646 四个漏洞。
@@ -35,17 +47,19 @@
 | 文件 | 说明 |
 |---|---|
 | `fixes.patch` | 相对 0.1.2-alpha.2 的统一 diff，修复 52631/52632/52644/52646（15 个文件，+668 / −44）。**注意：其中的 `assertConfinedUnderPolicy` 是带 fail-open 缺陷的旧版本，在 0.1.5 上必须叠加补充补丁 4** |
-| `qvd-2026-57410-transport-fence.patch` | 补充：TCP peer 判据（Host 声称 loopback 而 peer 不是则拒绝） |
-| `qvd-2026-52632-editor-read-fence.patch` | 补充：`tool-str-replace-editor` 的 `view` 补上读策略 |
-| `qvd-2026-52632-plugin-fs-fence.patch` | 补充：动态插件 fs 门面强制携带会话策略 |
-| `qvd-2026-52646-confined-spawn-fail-closed.patch` | 补充：受限 spawn 守卫改为 fail-closed（红队发现） |
-| `guard-repeat-text-reminder.patch` | 补充：新增纯文本循环守卫包 |
+| `fixes-0.1.5-rc.2.patch` | **0.1.5-rc.2 一键补丁（2026-09-23 新增，推荐）**：把基线 + 5 个补充补丁的最终效果合并为**单一自洽 diff**（48 文件，+2114 / −74）。**0.1.5-rc.2 用户请优先用它**，不要再用「基线 → 补充补丁」的分步流程 |
+| `code-runtime-isolation.patch` | 零日修复：`run_code` 代码运行时的沙箱隔离缺口（见下文「未公开发现」）。**尚未上报上游，暂不建议公开分发** |
+| `apply-dsh-fixes.bat` | 一键应用脚本：定位检出 → `--check` 预检 → 确认后应用（零日补丁单独二次确认） |
+| ~~5 个分项补丁~~ | **已并入 `fixes-0.1.5-rc.2.patch` 并从仓库移除**（2026-09-23）；逐项设计说明保留在 `FIXES.md` 与本文历史章节 |
 | `redteam-suites.patch` | 33 个红队对抗用例（3 个套件） |
+| `ATTACK-CHAIN.md` | **攻击链与阻断点**：7 条链逐项映射到补丁与用例，含交叉表 |
 | `REDTEAM.md` | 红队报告：攻击结果、已知绕过、未验证边界 |
 | `FIXES.md` | 每个漏洞的逐项说明、涉及文件、应用与验证方法 |
 | `verify-dsh-fixes.bat` | Windows 只读验证脚本（20 项检查，可选回归测试/重建） |
 | `README.md` | 本说明 |
 | `LICENSE` | MIT 许可 |
+
+> **关于文中出现的 `qvd-2026-*.patch`**：这 5 个分项补丁已于 2026-09-23 并入 `fixes-0.1.5-rc.2.patch` 并**从仓库移除**。下文对它们的引用保留作**审计记录**（说明每条链当初是怎么被掐断的），文件本身不再分发。
 
 ## ⚠️ 安全与责任声明
 
@@ -142,7 +156,32 @@ git apply -R fixes.patch        rem 撤销（反向应用）
 2. 需要回归测试或重建：`verify-dsh-fixes.bat -tests` 或 `-build`（需本机已装 `pnpm` 与依赖）。
 3. 应用修复：在基于 0.1.2-alpha.2 的检出上 `git apply --check fixes.patch` → `git apply fixes.patch`。
 
-## 0.1.5-rc.2 补充补丁
+## 0.1.5-rc.2 一键安装（推荐）
+
+> **⚠️ 2026-09-23 更正：`fixes.patch` 在干净的 0.1.5-rc.2 上打不上。**
+>
+> 实测（`git archive` 导出的干净树）有 5 个文件报 `patch does not apply`：
+> `packages/fs/fs/src/index.ts`、`packages/fs/tool-fs/src/read.ts`、`packages/fs/tool-fs/src/read-image.ts`、
+> `packages/subprocess/subprocess-local/src/spawn.ts`、`packages/subprocess/subprocess-local/tests/spawn.spec.ts`。
+> 原因是 0.1.2 → 0.1.5 之间上游改了这些文件的注释与代码（例如 `read.ts` 的注释多了 "scope-aware" 一词），
+> **不是行尾问题**（`--ignore-whitespace` 与 `-C1` 均无效）。本仓库此前「在 0.1.5-rc.2 上按序应用基线 → 补充补丁」的说明与事实不符，特此更正。
+
+**0.1.5-rc.2 请改用单一补丁：**
+
+```bat
+rem 在干净的 0.1.5-rc.2 检出上
+git apply --check fixes-0.1.5-rc.2.patch
+git apply       fixes-0.1.5-rc.2.patch
+```
+
+或直接运行一键脚本 `apply-dsh-fixes.bat`（先预检、再询问、后写入）。
+
+**它和「基线 + 补充补丁」的关系**：内容等价（基线 + 5 个补充的最终效果），但**单一自洽** —— 不会再出现「只打了基线、装上一个带 fail-open 缺陷的守卫」这种事故。`fixes.patch` 与 5 个补充补丁**保留**，供 0.1.2-alpha.2 用户与历史审计使用。
+
+## 0.1.5-rc.2 分项补丁说明（已并入单一补丁 · 保留作审计记录）
+
+> **2026-09-23：下列 5 个分项补丁已并入 `fixes-0.1.5-rc.2.patch`，并从仓库移除。**
+> 本节保留它们的设计说明与 0.1.5-rc.2 复核证据作为审计记录；其中的 `git apply` 命令已作废。
 
 > **⚠️ 先读这段：`fixes.patch` 与补充补丁的目标版本不同，不能互相替代。**
 >
@@ -168,27 +207,9 @@ git apply -R fixes.patch        rem 撤销（反向应用）
 
 > **升级版本不等于修好漏洞。** 基线补丁在 0.1.5-rc.2 上**不是历史包袱而是必需品**。
 
-**应用方式**（在 0.1.5-rc.2 检出上，**按序执行，基线在前**）：
+**应用方式（已作废）**：这 5 个分项补丁已于 2026-09-23 并入 `fixes-0.1.5-rc.2.patch` 并从仓库移除。
 
-```bat
-rem 1) 先应用基线（相对 0.1.2-alpha.2 的 diff，在 0.1.5 上同样适用）
-git apply --check fixes.patch
-git apply       fixes.patch
-
-rem 2) 再应用 5 个补充补丁（顺序不限，互不重叠）
-git apply --check qvd-2026-57410-transport-fence.patch
-git apply       qvd-2026-57410-transport-fence.patch
-git apply --check qvd-2026-52632-editor-read-fence.patch
-git apply       qvd-2026-52632-editor-read-fence.patch
-git apply --check qvd-2026-52632-plugin-fs-fence.patch
-git apply       qvd-2026-52632-plugin-fs-fence.patch
-git apply --check qvd-2026-52646-confined-spawn-fail-closed.patch
-git apply       qvd-2026-52646-confined-spawn-fail-closed.patch
-git apply --check guard-repeat-text-reminder.patch
-git apply       guard-repeat-text-reminder.patch
-```
-
-**补丁间的关系**（哪些会覆盖基线）：
+下表保留为**设计记录** —— 它说明了为什么必须用单一补丁：基线与 fail-closed 补丁改的是**同一个函数**，分开应用会出现"只打了基线、装上带 fail-open 缺陷的守卫"的窗口。
 
 | 补充补丁 | 与基线的关系 |
 |---|---|
@@ -204,7 +225,7 @@ git apply       guard-repeat-text-reminder.patch
 
 | 套件 | 用例数 | 结果 |
 |---|---|---|
-| 读栅栏对抗 | 16 | 15 阻断 / **1 已知绕过（硬链接）** |
+| 读栅栏对抗 | 16 | **14 阻断 / 1 已知绕过（硬链接） / 1 现状**（`danger-full-access` 语义即无限制） |
 | 受限 spawn 对抗 | 13 | 13 阻断（修复 fail-open 后） |
 | Agent Loop 终止性 | 4 | 4 通过 |
 | **合计** | **33** | |
@@ -240,6 +261,18 @@ git apply       guard-repeat-text-reminder.patch
 
 参考：腾讯朱雀实验室《A.I.G 红队实测 DeepSeek Harness》https://matrix.tencent.com/zh/2026/08/20/deepseek-harness-agent-injection-risk
 
+## 未公开发现：`run_code` 代码运行时隔离缺口（已提供修复，尚未上报上游）
+
+> **状态：未上报上游、未定级。** 本节只描述影响与修复，**不含可直接复现的攻击步骤**。
+
+- **影响**：`packages/code-runtime/code-runtime-worker-thread` 把模型代码交给 worker 的**全局作用域**执行（`AsyncFunction`），而该运行时**不接收会话沙箱策略**。
+- **实测对照**：同一会话、同一 `workspace-write` 策略下，`read` / `write` 工具与 `pwsh` 子进程对工作区外路径**全部被拒**，而 `run_code` 仍可读写工作区外文件、导入 `node:child_process`。
+- **零前置**：不需要网络暴露、令牌、Host 伪造、插件，也不需要模型越狱。
+- **修复**：`code-runtime-isolation.patch` —— 改用 `node:vm` 上下文执行程序体，禁用字符串代码生成（`codeGeneration: { strings: false, wasm: false }`），且**不提供** `importModuleDynamically` 回调；定时器以 null-prototype 包装注入（避免经 `.constructor` 回到宿主 realm）。
+- **验证**：`await import('node:fs')` 被拒（`ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING`）；`process` / `fetch` / `require` 不可见；`Function` 构造器与 `eval` 抛 `EvalError`；正常功能（顶层 await、绑定调用、console 捕获、异常路径、返回对象/数组）不受影响。
+- **已知边界（如实记录）**：跨 realm 的异常只保留 message、**丢失堆栈**；`vitest` 全量回归**未在本机跑通**（沙箱下 vite 的管道 `exec` 报 `spawn EPERM`），验证用的是直接驱动 `bootstrap.ts` 的针对性脚本。
+- **披露建议**：先交上游审核，再决定是否公开分发本补丁。
+
 ## 安全建议
 
 - **插件即代码**：不要加载来源不明、未经审查的插件；它们在宿主进程内执行。
@@ -273,7 +306,7 @@ certutil -hashfile "LICENSE" SHA256
 | `REDTEAM.md` | `A2BEAC9074F55517376481EBE5B4E768D19E6C39F162389021BEE12E45A03DF1` |
 | `LICENSE` | `B546772903BAEBAFB411FD4A5E1A5B91855659BF38C56165A7096712615C8AF9` |
 
-**0.1.5-rc.2 补充补丁：**
+**已移除的分项补丁（2026-09-23 并入单一补丁；哈希保留供审计）：**
 
 | 文件 | SHA-256 |
 |---|---|
@@ -283,6 +316,14 @@ certutil -hashfile "LICENSE" SHA256
 | `qvd-2026-52646-confined-spawn-fail-closed.patch` | `B930F5E4F1AF615F9983588101CF84ECF3A1CD55F8E83D031DFE563DAE17D6F3` |
 | `guard-repeat-text-reminder.patch` | `F9FD48F9D74132DD6879F9920FDC108532566D0189A1FB5CDB3502FC10E848E3` |
 | `redteam-suites.patch` | `07C023D9C9B9859DF713C6F1777041F48E4BC06112E2FEAF19119994B2D552EB` |
+
+**0.1.5-rc.2 一键补丁与零日修复（2026-09-23 新增）：**
+
+| 文件 | SHA-256 |
+|---|---|
+| `fixes-0.1.5-rc.2.patch` | `9A2FA061BE21B3BE4CFB98CD3F7ACCA0741C4DDBF71EF1503D6FF06BB9A4ABF5` |
+| `code-runtime-isolation.patch` | `C85FC4E4318B638F8F6D83FFCF67B60CE21661E76032342865AEA32945E59C66` |
+| `apply-dsh-fixes.bat` | 见 README 变更记录（脚本每次修改后重新公布） |
 
 说明：
 - README（`README.md` / `README.en.md`）不纳入哈希表：哈希值就写在 README 文件自身内部，无法用 README 自身内容证明它未被修改；请以其它独立文件为准。
@@ -299,6 +340,7 @@ certutil -hashfile "LICENSE" SHA256
 
 - DeepSeek Harness 官方仓库：https://github.com/deepseek-ai/DeepSeek-Harness
 - 逐项修复说明：见 `FIXES.md`
+- **攻击链与阻断点：见 `ATTACK-CHAIN.md`**
 - 红队测试报告：见 `REDTEAM.md`
 - QVD PoC 集合：https://github.com/Unclecheng-li/poc-lab
 - 腾讯朱雀实验室《A.I.G 红队实测 DeepSeek Harness》：https://matrix.tencent.com/zh/2026/08/20/deepseek-harness-agent-injection-risk

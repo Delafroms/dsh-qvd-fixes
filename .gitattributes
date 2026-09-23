@@ -1,0 +1,7 @@
+# Patch files must stay LF on every platform, or `git apply` fails on Windows
+# checkouts that use core.autocrlf=true.
+*.patch text eol=lf
+# Windows scripts keep CRLF.
+*.bat text eol=crlf
+# Documentation: LF everywhere (stable diffs).
+*.md text eol=lf
