@@ -31,6 +31,7 @@
 | `fixes-0.1.5-rc.2.patch` | **Consolidated patch for 0.1.5-rc.2** (48 files, +2114 / −74). Recommended for 0.1.5 users. |
 | `fixes.patch` | Unified diff against **0.1.2-alpha.2** (15 files, +668 / −44). Kept for 0.1.2 users and historical audit. |
 | `code-runtime-isolation.patch` | Fix for an **unreported** isolation gap in the `run_code` runtime. Do not redistribute before vendor review. |
+| `SECURITY-REPORT-en.md` | **Vendor report** (English): root cause, minimal reproduction, impact, fix, verification. **Contains reproducible detail.** |
 | `apply-dsh-fixes.bat` | One-click apply: locate checkout → `--check` → confirm → apply. |
 | `verify-dsh-fixes.bat` | Read-only marker verification (20 checks; optional `-tests` / `-build`). |
 | `ATTACK-CHAIN.md` | **Attack chains mapped to patches and test cases** (7 chains, with a cross-reference table). |
