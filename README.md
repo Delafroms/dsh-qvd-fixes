@@ -49,7 +49,6 @@
 | `fixes.patch` | 相对 0.1.2-alpha.2 的统一 diff，修复 52631/52632/52644/52646（15 个文件，+668 / −44）。**注意：其中的 `assertConfinedUnderPolicy` 是带 fail-open 缺陷的旧版本，在 0.1.5 上必须叠加补充补丁 4** |
 | `fixes-0.1.5-rc.2.patch` | **0.1.5-rc.2 一键补丁（2026-09-23 新增，推荐）**：把基线 + 5 个补充补丁的最终效果合并为**单一自洽 diff**（48 文件，+2114 / −74）。**0.1.5-rc.2 用户请优先用它**，不要再用「基线 → 补充补丁」的分步流程 |
 | `code-runtime-isolation.patch` | 零日修复：`run_code` 代码运行时的沙箱隔离缺口（见下文「未公开发现」）。**尚未上报上游，暂不建议公开分发** |
-| `SECURITY-REPORT-en.md` | **给上游的英文安全报告**：完整根因、最小复现步骤、影响、修复建议与验证结果。**含可直接复现的细节** |
 | `apply-dsh-fixes.bat` | 一键应用脚本：定位检出 → `--check` 预检 → 确认后应用（零日补丁单独二次确认） |
 | ~~5 个分项补丁~~ | **已并入 `fixes-0.1.5-rc.2.patch` 并从仓库移除**（2026-09-23）；逐项设计说明保留在 `FIXES.md` 与本文历史章节 |
 | `redteam-suites.patch` | 33 个红队对抗用例（3 个套件） |
@@ -273,7 +272,7 @@ git apply       fixes-0.1.5-rc.2.patch
 - **验证**：`await import('node:fs')` 被拒（`ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING`）；`process` / `fetch` / `require` 不可见；`Function` 构造器与 `eval` 抛 `EvalError`；正常功能（顶层 await、绑定调用、console 捕获、异常路径、返回对象/数组）不受影响。
 - **已知边界（如实记录）**：跨 realm 的异常只保留 message、**丢失堆栈**；`vitest` 全量回归**未在本机跑通**（沙箱下 vite 的管道 `exec` 报 `spawn EPERM`），验证用的是直接驱动 `bootstrap.ts` 的针对性脚本。
 - **披露建议**：先交上游审核，再决定是否公开分发本补丁。
-- **给上游的报告**：`SECURITY-REPORT-en.md`（英文，含最小复现步骤）。上游仓库**没有 `SECURITY.md`**，`CONTRIBUTING.md` 只指向公开的 GitHub Discussions —— 建议走 Security → Advisories → Report a vulnerability（私密渠道）。
+- **给上游的报告**：英文报告已完成（含最小复现步骤），但**不随本仓库分发** —— 只走私密渠道提交上游。上游仓库**没有 `SECURITY.md`**，`CONTRIBUTING.md` 只指向公开的 GitHub Discussions；建议走 Security → Advisories → Report a vulnerability（私密渠道）。
 
 ## 安全建议
 
