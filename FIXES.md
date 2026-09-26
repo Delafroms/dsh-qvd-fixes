@@ -18,6 +18,10 @@
 > `fixes.patch` 相对 **0.1.2-alpha.2** 生成；补充补丁针对 **0.1.5-rc.2**。把 0.1.5 的内容并进 `fixes.patch` 会让它在 0.1.2 上应用不了。
 > 在 0.1.5-rc.2 上必须**按序应用：基线 → 补充补丁**。原因是基线里的 `assertConfinedUnderPolicy` 是**带 fail-open 缺陷的旧版本**（`mode !== undefined` 前置条件让 `sandboxPolicy: {}` 静默放行），补充补丁 4 才会把它覆盖为 fail-closed。
 
+> **🆕 2026-09-26 更新：新增 `fixes-0.1.7-rc.2.patch`（0.1.7-rc.2 一键补丁），本文档新增文末[「0.1.7-rc.2 轮次（2026-09-26）」](#017-rc2-轮次2026-09-26)一节。**
+> 本轮在 0.1.7-rc.2 检出上落实 7 项修复（搜索根栅栏 / 凭据不可读 / `run_code` 逃逸封堵 / `/api/file` 根白名单 / `/api/session.export` 鉴权 / `/plugins` 与 `/plugins/events` 信任围栏 / duplicate Host 结构化拒绝），并**逐条列出 8 条残留**（未修就是未修）。
+> 0.1.5-rc.2 与 0.1.2-alpha.2 的说明保持原样，不受影响。
+
 本清单与 `fixes.patch` 配套：`fixes.patch` 是相对 DeepSeek Harness **0.1.2-alpha.2**（修复前基线）的统一 diff，可对任意基于该版本的检出执行：
 
 ```bat
@@ -31,7 +35,7 @@ git apply fixes.patch           rem 应用
 
 ## 改动概览
 
-**15 个文件，+668 / −44 行。**
+**15 个文件，+668 / −44 行**（0.1.2-alpha.2 基线补丁的规模；0.1.7-rc.2 轮次的规模见文末对应章节）。
 
 | QVD | 类别 | 涉及文件 |
 |---|---|---|
@@ -52,6 +56,8 @@ git apply fixes.patch           rem 应用
 - `fs-sandbox` 的 `readText`/`streamText`/`readBytes` 增加可选 `sandboxPolicy` 参数，经 `checkedReadTarget` 校验目标：read-only 只允许 workspaceRoot，workspace-write 使用 writableRoots，越界抛结构化 `FS_SANDBOX_DENIED`。
 - `tool-fs` 的 `FsSandboxController` 在读前解析会话策略并传入 fs 读方法，denial 经 `sandbox.mapError` 映射；无策略时透传（不影响宿主自有读取）。
 - **已知残留（本补丁未覆盖）**：进程级沙箱后端在 read-only 模式下仍把整个宿主文件系统只读暴露给受限 shell 子进程——bwrap 用 `--ro-bind / /`、landlock 用 `readOnly: ['/']`、seatbelt 为 allow-default（默认允许读）。即受限 bash/pwsh 仍可能读取 `~/.ssh`、`.env` 等敏感文件。详见文末「已知残留与限制」。
+- **2026-09-26 轮次补充（0.1.7-rc.2）**：① **搜索根栅栏** —— `grep` / `glob` 此前用 `ctx.subprocess.spawn` 裸跑 ripgrep、**不传策略**，一次 `grep` 就能读到 `read` 拒绝的内容；新增 `SearchSandboxFence`（`packages/fs/tool-fs-search/src/search-sandbox.ts`）在 **spawn 之前**做策略与根比对，拒绝文本与 `read` 完全一致。② **凭据不可读** —— 判据上移到 `packages/fs/fs/src/index.ts` 导出的 `isProtectedReadPath`，fs-sandbox 与搜索栅栏共用：`$DSH_HOME/.credentials*` 在**任何模式（含 `danger-full-access`）**都被拒（`FS_PERMISSION_DENIED`）；宿主侧读凭据走 `fs-local`，不受影响。
+- **已知残留 2（2026-09-26 新增）**：`read` / `glob` / `grep` 的拒绝提示提到 `sandbox_permissions`，但这三个工具的**工具 schema 没有该字段** —— 读侧「放宽一次」的审批入口缺失，提示语与可操作面不一致。
 
 ### QVD-2026-52644 — cordis 沙箱工具逃逸
 - 新增 `sandboxToolExec(exec)`：向外提供**白名单化**执行视图，仅含 `name` / `callId` / `arguments`（JSON clone）/ `signal`，不含 agent 或真实宿主对象。
@@ -84,6 +90,18 @@ git apply fixes.patch           rem 应用
   - seatbelt（macOS）：allow-default（默认允许读，仅拒绝写）。
 - **含义**：在 read-only 会话里跑的 bash/pwsh 仍可能 `cat ~/.ssh/id_rsa`、`cat .env` 等，读取沙箱未隔离的敏感文件。这是上游披露中 52632 根因的一部分，本补丁未收窄（收窄进程级读面需对三个后端做系统目录白名单，风险较高，且无法在 Windows 本机验证 Linux/macOS 后端）。
 - **缓解**：不要依赖"只读模式"保护敏感文件；把 `.ssh`、`.env`、云凭据等移出 agent 可读目录，或在独立容器/VM 中处理不可信内容。
+
+### 读侧「放宽一次」审批入口缺失（2026-09-26）
+
+- `read` / `glob` / `grep` 被拒时的提示文本提到 `sandbox_permissions`（升级提示），但**这三个工具的工具 schema 里没有该字段** —— 模型/用户看到提示，却没有对应的可操作入口去「放宽一次」。
+- 对照：会产生该提示的 `pwsh` 等工具本身声明了该字段。这属于**提示与能力面不一致**，不是拒绝逻辑错误。
+- 状态：**未修**。
+
+### 凭据存储的读面（2026-09-26 轮次后）
+
+- **已收窄**：`$DSH_HOME/.credentials*` 经模型可读面（`read` / 搜索栅栏 / fs-sandbox）在**任何模式（含 `danger-full-access`）**都被拒（`FS_PERMISSION_DENIED`）；判据由 `packages/fs/fs/src/index.ts` 的 `isProtectedReadPath` 单点导出。
+- **未收窄**：`shell` / `pwsh` 起动子进程后仍是**进程级读面**（`bwrap --ro-bind / /` 一类），仍可读取凭据文件。
+- 含义：链 F（沙箱内 Agent 自解除沙箱）的「读签名密钥 → 伪造 cookie」一步，**在进程内读面上被堵住，在 shell 通道上仍然敞开**。
 
 ### 更彻底的做法：升级官方修复版
 
@@ -365,3 +383,87 @@ worker 只做了两件事：`env: {}` 与 `execArgv: []` —— 都不构成边�
 - 未验证 read-only 会话下 `run_code` 工具是否仍可见。
 
 **披露建议**：先交上游审核，再决定是否公开分发。`apply-dsh-fixes.bat` 对它是**单独的二次确认**，默认不应用。
+
+> **2026-09-26 补充（架构变更）**：0.1.7-rc.2 上游已把 `code-runtime-worker-thread` 换成 `ptc-runtime-node` 架构，**本补丁不再适用于该版本**。本轮改在同一份 0.1.7-rc.2 检出的**新架构**上补齐宿主对象泄漏面，见下节第 3 项。
+
+---
+
+# 0.1.7-rc.2 轮次（2026-09-26）
+
+> 目标：本地 DSH **0.1.7-rc.2** 检出；补丁文件 `fixes-0.1.7-rc.2.patch`（**2026-09-26 主流程重生成：105 文件 / +5800 −157 / 719,078 字节，SHA-256 `B23EB756EED71AC30EDB79E7CA5D233CA1108F5C897570514FA357464D55101C`**；生成时排除 `**/src/**/*.js|.d.ts|*.map` 的编译残留）。
+> **本轮只写已落实的改动；8 条残留列在本节末尾，未修就是未修。**
+
+## 1. QVD-2026-52632 剩余缺口：`grep` / `glob` 的搜索根
+
+- **问题**：`grep` / `glob` 用 `ctx.subprocess.spawn` **裸跑 ripgrep、不传策略**，fs 栅栏因此看不到搜索根 —— 一次 `path: '~/.ssh'` 的 grep 就能读到 workspace 受限的 `read` 明确拒绝的内容。
+- **修复**：新增 `packages/fs/tool-fs-search/src/search-sandbox.ts`（`SearchSandboxFence`）。
+  - 每次调用**现取** `ctx.fs` / `ctx.sandboxPolicy`（插件可在装配之后才被挂载）；
+  - 用后端自己的 `resolve` + `contains` 比对：read-only → `workspaceRoot`；workspace-write → `writableRoots`（别名、符号链接、平台大小写都不会放宽包含关系）；
+  - 拒绝时抛与 `read` **文本完全一致**的 `[sandbox: …]` 标记 + 同一条升级提示，并保留结构化 `FS_SANDBOX_DENIED`（后端围栏的原文作 `cause`）；
+  - **在 spawn 之前**拦截；
+  - 无 `ctx.fs`、已挂载但不限制（`sandboxMode === undefined`）、或 `danger-full-access` → 直通（与无策略的 `read` 行为一致）。
+- **边界（写清楚）**：这是**受信任代码里的策略检查**，**不是**对 spawned 进程的内核隔离 —— ripgrep 的 argv 从不经 `ctx.sandbox.confine`，该 spawn 依然无约束，也不声明 `argvConfined`。
+- **附带**：12 条用例（`packages/fs/tool-fs-search/tests/search-root-fence.spec.ts`，含 “denies … before any spawn”“danger-full-access leaves the search unconfined” 等）；该包补了 `dsh-fs` / `dsh-sandbox` / `dsh-sandbox-policy` 依赖与 tsconfig references。
+
+## 2. 凭据不可读
+
+- **问题**：浏览器会话签名密钥存放在 `$DSH_HOME/.credentials*`；只要它能被模型可读面读到，链 F（沙箱内 Agent 自解除沙箱）就有伪造 cookie 的入口。
+- **修复**：判据上移到 `packages/fs/fs/src/index.ts` 导出的 `isProtectedReadPath`，**fs-sandbox 与搜索栅栏共用同一判据**：`$DSH_HOME/.credentials*` 在**任何模式（含 `danger-full-access`）**都被拒，错误码 `FS_PERMISSION_DENIED`。
+- **不受影响**：宿主侧读凭据走 `fs-local`，不经过围栏（宿主自有读取仍是契约内的透传）。
+- **残留**：`shell` / `pwsh` 仍可读凭据（进程级读面）。
+
+## 3. `run_code` 逃逸封堵（新架构）
+
+- **背景**：0.1.7 上游已换成 `ptc-runtime-node` 架构，旧的 worker-thread 版零日补丁不适用（见上一节末尾的补充）。
+- **问题**：注入到 vm realm 的**宿主对象**（console shim、每个 namespace 绑定、binding error class）自身带着可回到宿主 realm 的 `constructor` —— `console.log.constructor('return process.pid')()` 即可取回宿主 `process`。
+- **修复**：`packages/ptc-runtime/ptc-runtime-node/src/bootstrap.ts` 新增 `detachedHostSurface()` —— **null 原型包装** + `Reflect.construct` 保留 `new` 语义 + `WeakSet` 防环；console shim、每个 namespace 绑定、binding error class **全部**经它包装。
+- **实测**：同一表达式由**返回宿主 pid** 变为 `console.log.constructor is not a function`。
+
+## 4. `/api/file` 根白名单
+
+- `packages/api/session-controller/src/media-references.ts`：为 `GET|HEAD /api/file` 增加只读根 —— Workspace 注册表登记的路径 + `process.cwd()` + `os.tmpdir()`；可用 `Config.roots` 覆盖（空数组 → 用默认根）。
+- 越界：**403** + body `MEDIA_PATH_OUTSIDE_ROOTS`（**HEAD 无 body**）。
+- **残留**：`Config.roots` 目前**只有直接挂载才能设**，随附组合未把该项暴露到 `cordis.yml`。
+
+## 5. `/api/session.export` 鉴权
+
+- `packages/session-query/session-log-export/src/index.ts`：复用 Connection 的 `requestRejection`（Host / TCP peer / cookie 三合一），并加上与 `tool-session-query/workspace-access.ts` 同款的工作区绑定。
+- 越权与不存在**都**返回 403 `SESSION_LOG_EXPORT_OUTSIDE_WORKSPACE` —— **不泄漏存在性**。
+- **残留**：调用方身份只判到「部署」层（同一 `DSH_HOME` 多实例共享注册表时区分不了实例）；`includeDescendants` 拉入的后代日志**未逐个复检**。
+
+## 6. `/plugins/events` 与 `/plugins` 的信任围栏
+
+- `packages/client/hmr/src/index.ts`（SSE 频道）与 `packages/client/modules/src/index.ts`（bundle 路由）各自接 `browserTrustFence(ctx)`：未认证 **401**、异 Host / rebound **403**。
+- **在查找 bundle 之前**就拒绝；SSE 通道**不写任何帧**（未认证连接拿不到 plugin graph）。无 Connection 时通道直接 403 关闭（fail-closed）。
+
+## 7. duplicate Host 拒绝
+
+- `packages/client/connection/src/api-request-trust.ts` 新增结构化拒绝 code：`host-missing` / `host-repeated` / `host-unparsable` / `host-untrusted` / `host-authority-mismatch` / `peer-not-loopback` / `cross-site` / `origin-unparsable` / `origin-mismatch`。
+- **>1 个 Host**（`rawHeaders` 里的重复字段）**或 Host ≠ 请求自身权威**，一律拒绝 —— `node:http` 会把重复 Host 折叠成第一个，只看 `headers` 分辨不出来。
+- **残留**：结构化 code **已导出但未进 HTTP 响应体**（对外仍是 401/403 状态码 + 简短文本）。
+
+## 本轮残留清单（8 条，全部未修）
+
+| # | 残留 | 影响 |
+|---|---|---|
+| 1 | `read` / `glob` / `grep` 的拒绝提示提到 `sandbox_permissions`，但工具 schema 没有该字段 | 读侧「放宽一次」审批入口缺失 |
+| 2 | `shell` / `pwsh` 进程级读面（`bwrap --ro-bind / /` 一类） | 受限 shell 仍可读全盘，包括凭据 |
+| 3 | `/api/file` 的 `Config.roots` 只有直接挂载才能设 | 随附组合未暴露到 `cordis.yml` |
+| 4 | `session.export` 调用方身份只到「部署」层 | 同一 `DSH_HOME` 多实例共享注册表时区分不了实例 |
+| 5 | `includeDescendants` 拉入的后代日志未逐个复检 | 后代日志的工作区归属未验证 |
+| 6 | 结构化拒绝 code 未进 HTTP 响应体 | 调用方只能看状态码 |
+| 7 | `apps/web` e2e 未跑（`DSH_SNAPSHOT=replay pnpm run test:web`） | 浏览器侧装配未端到端验证 |
+| 8 | 上游官方 0.1.7-rc.2 对这些点**一条都没修** | 升级不等于修好；唯一例外是 `run_code` 那条零日 —— 官方换了 `ptc-runtime-node` 架构，旧 PoC 不再适用 |
+
+## 应用与验证
+
+```bat
+rem 干净的 0.1.7-rc.2 检出上
+git apply --check fixes-0.1.7-rc.2.patch
+git apply       fixes-0.1.7-rc.2.patch
+```
+
+- 一键脚本 `apply-dsh-fixes.bat` 按检出 `package.json` 的版本自动选择补丁（0.1.7 → 本补丁；否则 0.1.5 → `fixes-0.1.5-rc.2.patch`），先预检、再询问、后写入。
+- 静态验证：`verify-dsh-fixes.bat`（本轮新增 12 项检查，缺失记 `[SKIP]`，不影响 0.1.5 / 0.1.2 树上的基线结论）。
+- 定向测试：`pnpm exec vitest run packages/fs/tool-fs-search/tests/search-root-fence.spec.ts`（12 用例）。
+- 红队实测（2026-09-26）：见 `REDTEAM.md` 第五节。

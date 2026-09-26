@@ -4,29 +4,30 @@
 
 | 项目 | 值 |
 |---|---|
-| Target（目标版本） | DeepSeek Harness **0.1.2-alpha.2**（基线）+ **0.1.5-rc.2**（补充补丁） |
+| Target（目标版本） | DeepSeek Harness **0.1.2-alpha.2**（基线）+ **0.1.5-rc.2**（补充补丁）+ **0.1.7-rc.2**（2026-09-26 轮次） |
 | Status（性质） | Community patch（社区补丁，非官方） |
 | Scope（源码修复范围） | QVD-2026-52631 / 52632 / 52644 / 52646 |
 | Partially-fixed（部分修复） | QVD-2026-57410 |
-| 对抗验证 | 33 个红队用例（3 个套件） |
+| 对抗验证 | 33 个红队用例（3 个套件）+ 2026-09-26 的四组实测（`run_code` 逃逸 / cookie 伪造 / `/plugins/events` 未认证 / 上游 A-B 对照） |
 
 ## 30 秒版
 
 | 问题 | 答案 |
 |---|---|
 | 这是什么 | DeepSeek Harness 公开漏洞的**社区补丁 + 对抗测试 + 验证脚本**。非官方，非完整审计 |
-| 我该用哪个 | **0.1.5-rc.2 → `fixes-0.1.5-rc.2.patch`（单一补丁，一条命令）**；0.1.2-alpha.2 → `fixes.patch` |
+| 我该用哪个 | **0.1.7-rc.2 → `fixes-0.1.7-rc.2.patch`**；0.1.5-rc.2 → `fixes-0.1.5-rc.2.patch`（单一补丁，一条命令）；0.1.2-alpha.2 → `fixes.patch` |
 | 怎么装 | 跑 `apply-dsh-fixes.bat`（先 `--check` 预检、再询问、后写入），或手动 `git apply --check` → `git apply` |
 | 装完怎么验 | 跑 `verify-dsh-fixes.bat`（只读、不联网），再用 `-tests` 跑回归 |
-| 修了什么 | 52631 / 52632 / 52644 / 52646 四个漏洞有源码修复；57410 由上游 token 部分修复，本仓库补 TCP peer 判据 |
-| 还有什么没修 | 硬链接绕过、进程级沙箱读面、52631 的 env 全量投影 —— 见 [REDTEAM.md](./REDTEAM.md)「已知绕过汇总」 |
+| 修了什么 | 52631 / 52632 / 52644 / 52646 四个漏洞有源码修复；57410 由上游 token 部分修复，本仓库补 TCP peer 判据。2026-09-26 轮次另修 7 项：`grep`/`glob` 搜索根栅栏、凭据不可读、`run_code` 宿主对象逃逸、`/api/file` 根白名单、`/api/session.export` 鉴权、`/plugins` 与 `/plugins/events` 信任围栏、duplicate Host 拒绝 |
+| 还有什么没修 | 硬链接绕过、进程级沙箱读面（`shell`/`pwsh` 仍可读凭据）、52631 的 env 全量投影、读侧「放宽一次」审批入口缺失、`/api/file` 读根不可配置、`session.export` 只到「部署」层身份、结构化 code 未进响应体、`apps/web` e2e 未跑 —— 见 [REDTEAM.md](./REDTEAM.md)「已知绕过汇总」 |
 | 我不该期待什么 | 它**不解决间接提示注入**，也**不保证没有其它未发现的问题**；升级官方版本前请先看 [FIXES.md](./FIXES.md) |
 
 本仓库提供针对 DeepSeek Harness 公开披露漏洞的**社区补丁**、**对抗测试**与验证脚本。
 
 - **基线补丁**（`fixes.patch`）基于上游 **0.1.2-alpha.2**，修复 52631 / 52632 / 52644 / 52646 四个漏洞。
 - **补充补丁**（5 个）针对 **0.1.5-rc.2**：上游在 0.1.2 → 0.1.5 的三个版本区间里**没有修复任何一个 QVD**，且 57410 只被**部分**修复。补充补丁闭合了残留面与红队发现的新缺陷。
-- **红队套件**（33 个用例）主动尝试绕过本仓库自己的补丁，结果与已知绕过见 [REDTEAM.md](./REDTEAM.md)。
+- **2026-09-26 轮次**（**0.1.7-rc.2**，`fixes-0.1.7-rc.2.patch`）：闭合 52632 的**搜索根缺口**（`grep`/`glob`）与**凭据可读面**，封堵新架构下 `run_code` 的宿主对象逃逸，并给 `/api/file`、`/api/session.export`、`/plugins`、`/plugins/events` 补上根白名单/鉴权/信任围栏与 duplicate Host 拒绝。**8 条残留逐条列在下方专节**，未修就是未修。
+- **红队套件**（33 个用例）主动尝试绕过本仓库自己的补丁，结果与已知绕过见 [REDTEAM.md](./REDTEAM.md)（另含 2026-09-26 的四组实测）。
 
 > 本仓库**不是官方安全更新，也不是完整安全审计**；不保证不存在其它未发现、未覆盖或与版本相关的安全问题。**已知绕过与未验证边界在 `REDTEAM.md` 中明确列出，未隐藏。**
 
@@ -40,7 +41,9 @@
 4. `git apply --check fixes.patch` 补丁预检；
 5. 确认无误后 `git apply fixes.patch` 应用。
 
-**补充补丁（0.1.5-rc.2）：** 见下方[「0.1.5-rc.2 补充补丁」](#015-rc2-补充补丁)。
+**补充补丁（0.1.5-rc.2）：** 见下方[「0.1.5-rc.2 一键安装」](#015-rc2-一键安装推荐)。
+
+**最新轮次（0.1.7-rc.2，2026-09-26）：** 见下方[「0.1.7-rc.2 一键安装」](#017-rc2-一键安装2026-09-26-轮次) —— 搜索根栅栏、凭据不可读、`run_code` 封堵、HTTP 三处围栏。
 
 ## 目录内容
 
@@ -48,14 +51,15 @@
 |---|---|
 | `fixes.patch` | 相对 0.1.2-alpha.2 的统一 diff，修复 52631/52632/52644/52646（15 个文件，+668 / −44）。**注意：其中的 `assertConfinedUnderPolicy` 是带 fail-open 缺陷的旧版本，在 0.1.5 上必须叠加补充补丁 4** |
 | `fixes-0.1.5-rc.2.patch` | **0.1.5-rc.2 一键补丁（2026-09-23 新增，推荐）**：把基线 + 5 个补充补丁的最终效果合并为**单一自洽 diff**（48 文件，+2114 / −74）。**0.1.5-rc.2 用户请优先用它**，不要再用「基线 → 补充补丁」的分步流程 |
-| `code-runtime-isolation.patch` | 零日修复：`run_code` 代码运行时的沙箱隔离缺口（见下文「未公开发现」）。**尚未上报上游，暂不建议公开分发** |
+| `fixes-0.1.7-rc.2.patch` | **0.1.7-rc.2 一键补丁（2026-09-26 轮次）**：搜索根栅栏、凭据不可读、`run_code` 宿主对象封堵、`/api/file` 根白名单、`/api/session.export` 鉴权、`/plugins` 与 `/plugins/events` 围栏、duplicate Host 拒绝。**0.1.7-rc.2 用户请用它** |
+| `code-runtime-isolation.patch` | 零日修复（**仅适用 0.1.2–0.1.5 的 worker-thread 架构**）：`run_code` 代码运行时的沙箱隔离缺口（见下文「未公开发现」）。**尚未上报上游，暂不建议公开分发**；0.1.7-rc.2 已换 `ptc-runtime-node` 架构，见下节 |
 | `apply-dsh-fixes.bat` | 一键应用脚本：定位检出 → `--check` 预检 → 确认后应用（零日补丁单独二次确认） |
 | ~~5 个分项补丁~~ | **已并入 `fixes-0.1.5-rc.2.patch` 并从仓库移除**（2026-09-23）；逐项设计说明保留在 `FIXES.md` 与本文历史章节 |
 | `redteam-suites.patch` | 33 个红队对抗用例（3 个套件） |
 | `ATTACK-CHAIN.md` | **攻击链与阻断点**：7 条链逐项映射到补丁与用例，含交叉表 |
 | `REDTEAM.md` | 红队报告：攻击结果、已知绕过、未验证边界 |
 | `FIXES.md` | 每个漏洞的逐项说明、涉及文件、应用与验证方法 |
-| `verify-dsh-fixes.bat` | Windows 只读验证脚本（20 项检查，可选回归测试/重建） |
+| `verify-dsh-fixes.bat` | Windows 只读验证脚本（**32 项检查**：基线 11 + 0.1.5 补充与红队 9 + 0.1.7 轮次 12；可选回归测试/重建） |
 | `README.md` | 本说明 |
 | `LICENSE` | MIT 许可 |
 
@@ -95,9 +99,11 @@
 - **补充修复**：
   - `qvd-2026-52632-editor-read-fence.patch` —— `tool-str-replace-editor` 的 `view` 命令此前读文件**不带策略**（写路径本来就有），已补上。
   - `qvd-2026-52632-plugin-fs-fence.patch` —— 动态 Cordis 插件经 `inject: ['fs']` 拿到的 fs 服务，**读路径**在无 policy 时透传（写路径已默认 `resolve()`，**这个读写不一致本身就是缺陷**）。围栏加在**动态插件进入系统的边界**（`sandboxContext` 门面），**不改宿主契约**。
+  - **2026-09-26 轮次（0.1.7-rc.2）**：④ **搜索根栅栏** —— `grep` / `glob` 此前裸跑 ripgrep、不传策略，新增 `SearchSandboxFence` 在 **spawn 之前**校验搜索根，拒绝文本与 `read` 完全一致（12 条用例）；⑤ **凭据不可读** —— `$DSH_HOME/.credentials*` 经模型可读面在**任何模式（含 `danger-full-access`）**都被拒，判据 `isProtectedReadPath` 由 `fs` 包单点导出、fs-sandbox 与搜索栅栏共用。
 - **已知残留（未修复）**：
   1. **进程级读面**：bwrap `--ro-bind / /`、landlock `readOnly: ['/']`、seatbelt allow-default 仍把整个宿主只读暴露给受限 shell 子进程。只读会话里的 bash/pwsh 仍可能读取 `~/.ssh`、`.env` 等。**deferred — requires platform-specific validation**（需 Linux/macOS 验证后端）。
   2. **硬链接绕过**（红队实测确认）：工作区内指向外部 inode 的硬链接，**路径判定无法察觉**，读取成功。利用前提是攻击者**已能在工作区创建硬链接**（已有写原语），故属限制而非独立漏洞。**缓解**：敏感文件不要放在与工作区同一卷（硬链接不能跨卷）。
+  3. **读侧「放宽一次」审批入口缺失**（2026-09-26）：`read` / `glob` / `grep` 的拒绝提示提到 `sandbox_permissions`，但这三个工具的 schema **没有该字段**；凭据经 `shell` / `pwsh` 仍可读（同残留 1）。
   详见 `REDTEAM.md` 与 `FIXES.md`。
 
 ### QVD-2026-52644 — cordis 沙箱工具逃逸（CVSS 高危）
@@ -119,20 +125,24 @@
 - **残留（本仓库补充修复）**：信任判断**仍无 TCP 层输入**——`ConnectionTrustRequest` 只携带 `headers`，且 `BrowserAuth.authorizeIndex`（token → cookie 交换）**完全没有 peer 校验**。上游 PoC 给出的修复建议原文就是「校验 TCP `remoteAddress` 而非 `Host` 头」，未被采纳。
   **含义**：token 成为唯一防线。token 一旦泄露（URL 进日志、Referer、截图、被分享的链接），伪造 `Host: 127.0.0.1` 即可换取浏览器 cookie。
 - **补充修复**：`qvd-2026-57410-transport-fence.patch` —— 新增**传输围栏**（Host 声称 loopback 而 peer 不是 loopback → 拒绝），并给 token 交换加 peer 校验；新配置 `trustedProxies`（默认空 = 最严格）。
+- **2026-09-26 轮次（0.1.7-rc.2）**：① **duplicate Host 拒绝** —— `>1` 个 Host（读 `rawHeaders`，不被 `node:http` 的折叠骗过）或 Host ≠ 请求自身权威，一律拒绝，并导出 9 个结构化 code；② **`/api/file` 只读根白名单**（越界 403 `MEDIA_PATH_OUTSIDE_ROOTS`）；③ **`/api/session.export` 复用同一套 `requestRejection` + 工作区绑定**（越权与不存在都 403 `SESSION_LOG_EXPORT_OUTSIDE_WORKSPACE`）；④ **`/plugins` 与 `/plugins/events` 信任围栏**（未认证 401、异 Host/rebound 403，且在查找 bundle 之前拒绝）。
+- **残留（2026-09-26）**：结构化 code **未进 HTTP 响应体**；`/api/file` 的 `Config.roots` **只有直接挂载才能设**；`session.export` 身份**只到「部署」层**（多实例共享 `DSH_HOME` 注册表时区分不了实例），`includeDescendants` 拉入的后代日志**未逐个复检**。
 
 ## 运行 verify-dsh-fixes.bat 会发生什么
 
 脚本逻辑固定，行为可预期：
 
 - **只读检测**：用 `findstr` 逐个比对源码中的修复标记，输出 `[PASS]` / `[FAIL]` / `[SKIP]` 与汇总。
-- **两类检查**：
+- **三类检查**：
   - **基线项**（11 项）：缺失记 `[FAIL]`，计入退出码；
-  - **可选补充补丁 + 红队套件**（9 项）：缺失记 `[SKIP]`，**不计入 FAIL**——补充补丁是可选增量，未应用不代表基线有问题。
+  - **可选补充补丁 + 红队套件**（9 项）：缺失记 `[SKIP]`，**不计入 FAIL**——补充补丁是可选增量，未应用不代表基线有问题；
+  - **0.1.7-rc.2 轮次项**（12 项，2026-09-26 新增）：搜索根栅栏、凭据不可读、`run_code` 宿主对象封堵、`/api/file` 根白名单、`session.export` 鉴权、`/plugins` 两处围栏、duplicate Host 结构化 code、以及该包的依赖声明。同样缺失记 `[SKIP]`，**不计入 FAIL**——在 0.1.2 / 0.1.5 树上这些标记本就不存在。
 - **三种结果**：
   1. 定位到检出且基线修复齐全 → 基线项全 `[PASS]`，退出码 0；
   2. 定位到检出但缺基线修复 → 对应项 `[FAIL]`，退出码 1（只输出信息，不改文件）；
   3. 未定位到检出 → 提示"未找到检出根目录"，退出码 2（无副作用）。
-- **定位规则**：脚本所在目录含 `package.json` 即视为检出根；否则读环境变量 `DSH_REPO`；再否则向上两级查找。
+- **定位规则**：脚本所在目录含 `package.json` 即视为检出根；否则读环境变量 `DSH_REPO`；再否则**当前目录**（需同时含 `packages\fs\fs-sandbox`，避免误判）；再否则向上两级查找。
+- **编码**：`verify-dsh-fixes.bat` 自 2026-09-26 起为 **UTF-8（无 BOM）**，配合文件内的 `chcp 65001`，中文提示不再乱码（此前文件是 GBK 却切到 65001，输出为乱码）。
 - **可选 `-tests` / `-build`**：需手动输入 `Y` 才执行，且调用的是**你自己机器上的 `pnpm`**（跑 DSH 回归测试 / 重建）。未安装 `pnpm` 或依赖时会报错退出，不产生破坏。
 - 全程**不联网、不上传、不下载、不执行外部程序**。
 
@@ -158,6 +168,8 @@ git apply -R fixes.patch        rem 撤销（反向应用）
 
 ## 0.1.5-rc.2 一键安装（推荐）
 
+> **0.1.7-rc.2 用户请直接看下一节**（更新的一轮修复在 `fixes-0.1.7-rc.2.patch` 里）。
+
 > **⚠️ 2026-09-23 更正：`fixes.patch` 在干净的 0.1.5-rc.2 上打不上。**
 >
 > 实测（`git archive` 导出的干净树）有 5 个文件报 `patch does not apply`：
@@ -177,6 +189,43 @@ git apply       fixes-0.1.5-rc.2.patch
 或直接运行一键脚本 `apply-dsh-fixes.bat`（先预检、再询问、后写入）。
 
 **它和「基线 + 补充补丁」的关系**：内容等价（基线 + 5 个补充的最终效果），但**单一自洽** —— 不会再出现「只打了基线、装上一个带 fail-open 缺陷的守卫」这种事故。`fixes.patch` 与 5 个补充补丁**保留**，供 0.1.2-alpha.2 用户与历史审计使用。
+
+## 0.1.7-rc.2 一键安装（2026-09-26 轮次）
+
+> **只写已落实的改动；残留 8 条列在本节末尾，不写成已解决。**
+
+```bat
+rem 在干净的 0.1.7-rc.2 检出上
+git apply --check fixes-0.1.7-rc.2.patch
+git apply       fixes-0.1.7-rc.2.patch
+```
+
+或直接运行 `apply-dsh-fixes.bat`：脚本按检出 `package.json` 的版本**自动选择补丁**（0.1.7 → 本补丁；否则 0.1.5 → `fixes-0.1.5-rc.2.patch`），先预检、再询问、后写入。
+
+**本轮新增/变更（7 项）**
+
+| # | 修复 | 位置 | 说明 |
+|---|---|---|---|
+| 1 | 52632 剩余缺口：`grep`/`glob` 搜索根 | `packages/fs/tool-fs-search/src/search-sandbox.ts`（新增 `SearchSandboxFence`） | 此前 `glob`/`grep` 用 `ctx.subprocess.spawn` 裸跑 ripgrep、**不传策略**，一次 `path: '~/.ssh'` 的 grep 就能读到 `read` 拒绝的内容。现在每次调用现取 `ctx.fs`/`ctx.sandboxPolicy`，`resolve` + `contains` 比对 workspaceRoot（read-only）/ writableRoots（workspace-write），拒绝时抛与 `read` **完全一致**的 `[sandbox: …]` + 升级提示，且**在 spawn 之前**拦截；无 fs 或不限制（`danger-full-access`）→ 直通。附带 12 条用例（`tests/search-root-fence.spec.ts`），该包补了 `dsh-fs`/`dsh-sandbox`/`dsh-sandbox-policy` 依赖与 tsconfig references |
+| 2 | 凭据不可读 | `packages/fs/fs/src/index.ts` 导出 `isProtectedReadPath` | 判据上移，fs-sandbox 与搜索栅栏共用：`$DSH_HOME/.credentials*` 在**任何模式（含 `danger-full-access`）**都被拒（`FS_PERMISSION_DENIED`）；宿主侧读凭据走 `fs-local`，不受影响 |
+| 3 | `run_code` 逃逸封堵 | `packages/ptc-runtime/ptc-runtime-node/src/bootstrap.ts` | 新增 `detachedHostSurface()`（null 原型包装 + `Reflect.construct` 保留 `new`，`WeakSet` 防环），console shim / 每个 namespace 绑定 / binding error class 全部包装。实测 `console.log.constructor('return process.pid')()` 由**返回宿主 pid** 变为 `console.log.constructor is not a function` |
+| 4 | `/api/file` 根白名单 | `packages/api/session-controller/src/media-references.ts` | 加只读根：Workspace 注册表路径 + cwd + `os.tmpdir()`，可用 `Config.roots` 覆盖；越界 403 + body `MEDIA_PATH_OUTSIDE_ROOTS`（HEAD 无 body） |
+| 5 | `/api/session.export` 鉴权 | `packages/session-query/session-log-export/src/index.ts` | 复用 Connection 的 `requestRejection`（Host / TCP peer / cookie）+ 与 `tool-session-query/workspace-access.ts` 同款的工作区绑定；越权与不存在**都**返回 403 `SESSION_LOG_EXPORT_OUTSIDE_WORKSPACE`（不泄漏存在性） |
+| 6 | `/plugins/events`、`/plugins` 信任围栏 | `packages/client/hmr/src/index.ts`、`packages/client/modules/src/index.ts` | 未认证 401、异 Host / rebound 403，且**在查找 bundle 之前**就拒绝（不写任何 SSE 帧） |
+| 7 | duplicate Host 拒绝 | `packages/client/connection/src/api-request-trust.ts` | 结构化拒绝 code（`host-missing` / `host-repeated` / `host-unparsable` / `host-untrusted` / `host-authority-mismatch` / `peer-not-loopback` / `cross-site` / `origin-unparsable` / `origin-mismatch`）；**>1 个 Host 或 Host ≠ 请求权威一律拒绝** |
+
+**残留与未修（8 条，如实记录）**
+
+1. **读侧「放宽一次」审批入口缺失**：`read` / `glob` / `grep` 的拒绝提示提到 `sandbox_permissions`，但这三个工具的**工具 schema 没有该字段**。
+2. **进程级读面未修**：`shell` / `pwsh` 仍可读全盘（`bwrap --ro-bind / /` 一类），**包括凭据**。
+3. **`/api/file` 的 `Config.roots` 只有直接挂载才能设**：随附组合未暴露到 `cordis.yml`。
+4. **`session.export` 的调用方身份只到「部署」层**：同一 `DSH_HOME` 多实例共享注册表时区分不了实例。
+5. **`includeDescendants` 拉入的后代日志未逐个复检**。
+6. **结构化拒绝 code 已导出但未进 HTTP 响应体**。
+7. **`apps/web` e2e 未跑**（`DSH_SNAPSHOT=replay pnpm run test:web`）。
+8. **上游官方 0.1.7-rc.2 对这些点一条都没修**（除 `run_code` 那条零日：官方已换 `ptc-runtime-node` 架构，旧 PoC 不再适用）。
+
+**验证**：静态 → `verify-dsh-fixes.bat`（本轮新增 12 项检查，缺失记 `[SKIP]`）；定向 → `pnpm exec vitest run packages/fs/tool-fs-search/tests/search-root-fence.spec.ts`；红队 → 见 [REDTEAM.md](./REDTEAM.md) 第五节。
 
 ## 0.1.5-rc.2 分项补丁说明（已并入单一补丁 · 保留作审计记录）
 
@@ -230,6 +279,15 @@ git apply       fixes-0.1.5-rc.2.patch
 | Agent Loop 终止性 | 4 | 4 通过 |
 | **合计** | **33** | |
 
+**2026-09-26 实测（0.1.7-rc.2，四组）**：
+
+| 实测 | 结果 |
+|---|---|
+| `run_code` 逃逸（新架构） | `console.log.constructor('return process.pid')()` 由**返回宿主 pid** 变为 `console.log.constructor is not a function` |
+| cookie 伪造（链 F 方向） | token→cookie 交换被 peer 判据拒绝；duplicate Host 与 Host≠权威被新 code 拒绝；凭据经 `read`/搜索栅栏已不可读（`shell`/`pwsh` 仍可读） |
+| `/plugins/events` 未认证 | 未认证 **401 且不写任何帧**；异 Host / rebound **403**（查找 bundle 之前拒绝） |
+| 上游 A/B 对照 | 官方 0.1.7-rc.2 对本轮 6 项**一条都没修**；`run_code` 那项只是换了 `ptc-runtime-node` 架构 |
+
 **Agent Loop 重复输出的结论**：经 Model/Harness 分离实测，模型返回纯文本（无 tool-call block）时 loop **只请求 1 次即终止**——终止逻辑正确，**不是 Harness 状态机缺陷**。真实缺口是**没有任何守卫覆盖纯文本重复**（`repeat-tool-reminder` 只挂在 `tools/post-execute`，需有工具调用才触发）。`guard-repeat-text-reminder.patch` 补上了这一层。
 
 **测试环境**：Windows 11 x64、非管理员账户。所有攻击只在临时目录、测试文件、Canary 与 Mock Sink 上进行，**无外部副作用**。
@@ -243,6 +301,12 @@ git apply       fixes-0.1.5-rc.2.patch
 | `danger-full-access` 不设栅栏 | 该模式语义即"无限制" | 设计如此 |
 | 进程级沙箱读面 | read-only 会话的 shell 仍可读宿主文件 | **deferred** |
 | 52631 env 全量投影 | `!!js process.env.X` 可读任意环境变量 | **未修复（架构限制）** |
+| 凭据经 `shell` / `pwsh` 可读 | 进程级读面仍是全盘只读 | **未修复**（2026-09-26 轮次未动） |
+| 读侧「放宽一次」审批入口 | `read`/`glob`/`grep` schema 无 `sandbox_permissions` | **缺失** |
+| `/api/file` 读根不可配置 | `Config.roots` 只有直接挂载才能设 | **未修复** |
+| `session.export` 多实例区分 / 后代复检 | 身份只到「部署」层 | **未修复** |
+| 结构化拒绝 code 进响应体 | 已导出，未进 HTTP body | **未实现** |
+| `apps/web` e2e | `DSH_SNAPSHOT=replay pnpm run test:web` | **未跑** |
 
 ### 尚未验证（Unknown / Not Verified）
 
@@ -264,6 +328,8 @@ git apply       fixes-0.1.5-rc.2.patch
 ## 未公开发现：`run_code` 代码运行时隔离缺口（已提供修复，尚未上报上游）
 
 > **状态：未上报上游、未定级。** 本节只描述影响与修复，**不含可直接复现的攻击步骤**。
+>
+> **2026-09-26 更新（架构变更）**：0.1.7-rc.2 上游已把 `code-runtime-worker-thread` 换成 `ptc-runtime-node` 架构，因此 `code-runtime-isolation.patch` **只适用 0.1.2–0.1.5**。本轮改在同一份 0.1.7-rc.2 检出的新架构上，用 `bootstrap.ts` 的 `detachedHostSurface()` 封堵注入对象的宿主 realm 泄漏面（实测 `console.log.constructor('return process.pid')()` 由返回宿主 pid 变为 `console.log.constructor is not a function`）。
 
 - **影响**：`packages/code-runtime/code-runtime-worker-thread` 把模型代码交给 worker 的**全局作用域**执行（`AsyncFunction`），而该运行时**不接收会话沙箱策略**。
 - **实测对照**：同一会话、同一 `workspace-write` 策略下，`read` / `write` 工具与 `pwsh` 子进程对工作区外路径**全部被拒**，而 `run_code` 仍可读写工作区外文件、导入 `node:child_process`。
@@ -280,8 +346,9 @@ git apply       fixes-0.1.5-rc.2.patch
 - **网页/搜索内容不受信任**：对"抓取网页 / 搜索"类工具返回的内容保持警惕，它可能诱导后续危险操作。
 - **保持本地监听**：DSH Web 应只绑定 `127.0.0.1`，不要设为 `0.0.0.0` 暴露到局域网/公网。
 - **只用官方来源**：从 DeepSeek Harness 官方仓库获取与更新代码。
-- **优先升级官方修复版**：本补丁基于 0.1.2-alpha.2（补充补丁针对 0.1.5-rc.2）；官方后续版本可能已修复这些漏洞，以官方 changelog 为准。**但注意**：截至 0.1.5-rc.2，上游**一个 QVD 都没修**，57410 也只修了一半——升级不等于安全。
-- **只读模式不保护敏感文件**：本补丁收窄了进程内读取，但进程级沙箱仍把整个宿主只读暴露给受限 shell；处理不可信内容时请把 `.ssh`、`.env`、云凭据等移出 agent 可读目录，**并确保它们与工作区不在同一卷**（防硬链接绕过）。
+- **优先升级官方修复版**：本补丁基于 0.1.2-alpha.2（补充补丁针对 0.1.5-rc.2，轮次补丁针对 0.1.7-rc.2）；官方后续版本可能已修复这些漏洞，以官方 changelog 为准。**但注意**：截至 0.1.7-rc.2，上游**一个 QVD 都没修**（57410 只修了一半；2026-09-26 轮次的 7 项里 6 项官方一条未修，第 7 项只是换了架构）——升级不等于安全。
+- **只读模式不保护敏感文件**：0.1.7 轮次后 `$DSH_HOME/.credentials*` 经模型可读面（`read` / `glob` / `grep`）在任何模式都被拒，但**进程级沙箱仍把整个宿主只读暴露给受限 shell（`shell` / `pwsh`）**；处理不可信内容时请把 `.ssh`、`.env`、云凭据等移出 agent 可读目录，**并确保它们与工作区不在同一卷**（防硬链接绕过）。
+- **读侧没有「放宽一次」入口**：`read` / `glob` / `grep` 被拒时提示里会出现 `sandbox_permissions`，但这三个工具 schema 没有该字段 —— 需要放宽请在会话/工具层处理，不要期待审批弹窗。
 - **不要把 DSH Web 暴露到非 loopback**：57410 的残留面意味着 token 是唯一防线，而 token 可能经日志/截图/分享链接泄露。
 - 应用补丁前先 `--check` 并在测试环境验证。
 
@@ -291,7 +358,9 @@ git apply       fixes-0.1.5-rc.2.patch
 
 ```bat
 certutil -hashfile "verify-dsh-fixes.bat" SHA256
+certutil -hashfile "apply-dsh-fixes.bat" SHA256
 certutil -hashfile "fixes.patch" SHA256
+certutil -hashfile "ATTACK-CHAIN.md" SHA256
 certutil -hashfile "FIXES.md" SHA256
 certutil -hashfile "REDTEAM.md" SHA256
 certutil -hashfile "LICENSE" SHA256
@@ -301,11 +370,13 @@ certutil -hashfile "LICENSE" SHA256
 
 | 文件 | SHA-256 |
 |---|---|
-| `verify-dsh-fixes.bat` | `6A0D8ECBF5B216347713A73D14437B3813FC043A2DB55685DD570EE9B731CD5B` |
+| `verify-dsh-fixes.bat` | `A391BB91DED7D9F764A5C37D16CF1FE98A5D1B15859EE73D36FDF3461078875A`（2026-09-26：新增 0.1.7 轮次 12 项检查、改 UTF-8） |
 | `fixes.patch` | `727290C97B539F4988A83803A6B4AE5E9F44F10FC1DC5D8A0981F466D3F13D0E` |
-| `FIXES.md` | `D332DB66BDB47ECF2F13BD492D8328242367D300E78B154653F750CD35EED3E5` |
-| `REDTEAM.md` | `A2BEAC9074F55517376481EBE5B4E768D19E6C39F162389021BEE12E45A03DF1` |
+| `FIXES.md` | `7A675529FDCCB1E7B889914B3661268EF4A32A1D48D955CC0E9F6A3A1225DFA8` |
+| `REDTEAM.md` | `3F11B9E352C864B46F1F5B9236FE9CE2520EA3D23911D409761F8AA21959315F` |
 | `LICENSE` | `B546772903BAEBAFB411FD4A5E1A5B91855659BF38C56165A7096712615C8AF9` |
+| `ATTACK-CHAIN.md` | `3E184FE5468A7EF03EE9437B96091C544AD1BD7BAFBCEA0CC24304FC7896CF1A` |
+| `apply-dsh-fixes.bat` | `1EF4DAAFD443303D4E74798B9D4FADB3F5971917274A8A19A67E7D3323F1362C` |
 
 **已移除的分项补丁（2026-09-23 并入单一补丁；哈希保留供审计）：**
 
@@ -323,8 +394,9 @@ certutil -hashfile "LICENSE" SHA256
 | 文件 | SHA-256 |
 |---|---|
 | `fixes-0.1.5-rc.2.patch` | `9A2FA061BE21B3BE4CFB98CD3F7ACCA0741C4DDBF71EF1503D6FF06BB9A4ABF5` |
+| `fixes-0.1.7-rc.2.patch` | `B23EB756EED71AC30EDB79E7CA5D233CA1108F5C897570514FA357464D55101C`（2026-09-26 主流程重生成：**105 文件 / +5800 −157 / 719,078 字节**；生成时排除 `**/src/**/*.js|.d.ts|*.map` 的编译残留） |
 | `code-runtime-isolation.patch` | `C85FC4E4318B638F8F6D83FFCF67B60CE21661E76032342865AEA32945E59C66` |
-| `apply-dsh-fixes.bat` | 见 README 变更记录（脚本每次修改后重新公布） |
+| `apply-dsh-fixes.bat` | `1EF4DAAFD443303D4E74798B9D4FADB3F5971917274A8A19A67E7D3323F1362C` |
 
 说明：
 - README（`README.md` / `README.en.md`）不纳入哈希表：哈希值就写在 README 文件自身内部，无法用 README 自身内容证明它未被修改；请以其它独立文件为准。

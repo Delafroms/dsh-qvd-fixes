@@ -8,12 +8,12 @@
 
 | 项目 | 值 |
 |---|---|
-| 目标 | DeepSeek Harness `0.1.5-rc.2`（本地检出 `D:\deepseek-harness-master\dsh-0.1.5-rc.2`） |
-| 补丁 | 本仓库 `fixes.patch` + **五个**补充补丁（2026-09-23 起 0.1.5-rc.2 亦可用单一补丁 `fixes-0.1.5-rc.2.patch`） |
+| 目标 | DeepSeek Harness `0.1.5-rc.2`（本地检出 `D:\deepseek-harness-master\dsh-0.1.5-rc.2`）；**2026-09-26 轮次目标为本地 `0.1.7-rc.2` 检出** |
+| 补丁 | 本仓库 `fixes.patch` + **五个**补充补丁（2026-09-23 起 0.1.5-rc.2 亦可用单一补丁 `fixes-0.1.5-rc.2.patch`）；2026-09-26 轮次用 `fixes-0.1.7-rc.2.patch` |
 | 平台 | Windows 11 x64，Node v24.20.0，非管理员账户 |
 | 隔离方式 | 每个用例使用 `mkdtemp` 临时目录；workspace 与 outside 为同级目录；canary 为测试专用文件 |
 | 外部副作用 | **无**。不联网、不触碰真实账号/服务器/数据；subprocess 守卫测试为纯谓词，不启动任何进程 |
-| 测试日期 | 2026-09-18 |
+| 测试日期 | 2026-09-18（第一、二、三、四节）；**2026-09-26（第五节）** |
 
 ## 证据分级
 
@@ -197,7 +197,61 @@ if (mode !== undefined && mode !== 'danger-full-access' && spec.argvConfined !==
 
 ---
 
-## 五、已知绕过汇总
+## 五、2026-09-26 实测（0.1.7-rc.2 轮次）
+
+测试日期：**2026-09-26**。目标：本地 **0.1.7-rc.2** 检出 + 本轮 `fixes-0.1.7-rc.2.patch`。平台同上（Windows 11 x64，非管理员）。
+
+> 口径：本节四组结果来自**源码标记核对 + 针对性驱动**。**`apps/web` 的浏览器 e2e（`DSH_SNAPSHOT=replay pnpm run test:web`）没有跑**（见第七节）。
+
+### 1. `run_code` 逃逸（新架构）
+
+| 探针 | 修复前 | 修复后 |
+|---|---|---|
+| `console.log.constructor('return process.pid')()` | 返回**宿主 pid** | `console.log.constructor is not a function` |
+
+- **原理**：注入 vm realm 的宿主对象自带可回到宿主 realm 的 `constructor`；修复后 console shim、每个 namespace 绑定、binding error class **全部**经 `detachedHostSurface()`（null 原型包装 + `Reflect.construct` 保留 `new` + `WeakSet` 防环）包装。
+- **证据**：`packages/ptc-runtime/ptc-runtime-node/src/bootstrap.ts` 中 `detachedHostSurface` 的定义与三处调用。
+- **边界（如实记录）**：封的是**这一条逃逸面**；`shell` / `pwsh` 的进程级读面在本轮**未修**。
+
+### 2. cookie 伪造（链 F 方向）
+
+| 探针 | 结果 |
+|---|---|
+| token→cookie 交换：伪造 Host + peer 非 loopback | **拒绝**（peer 判据，2026-09-23 轮次引入） |
+| duplicate Host（`rawHeaders` 里两个 Host 字段） | **拒绝**（本轮新增 `host-repeated`） |
+| Host 与请求自身权威不一致 | **拒绝**（本轮新增 `host-authority-mismatch`） |
+
+- 本轮新增的是**结构化拒绝 code**；**code 未进 HTTP 响应体**（对外仍是状态码 + 简短文本）—— 这是残留，不是已完成项。
+- 凭据（浏览器会话签名密钥）经 `read` / 搜索栅栏 / fs-sandbox **已不可读**（任何模式，含 `danger-full-access`，错误码 `FS_PERMISSION_DENIED`）；但 `shell` / `pwsh` 起动子进程后**仍可读**。即：链 F 的「读密钥 → 伪造 cookie」一步，**进程内读面被堵住，shell 通道仍然敞开**。
+
+### 3. `/plugins/events` 未认证
+
+| 探针 | 修复前 | 修复后 |
+|---|---|---|
+| 未认证 GET `/plugins/events` | 可读到 plugin graph 的 SSE 帧 | **401**，且**不写任何帧** |
+| 异 Host / rebound 请求 | 同上 | **403**（在查找 bundle 之前就拒绝） |
+| 无 Connection 的装配 | —— | 403，通道 fail-closed 关闭 |
+
+- **证据**：`packages/client/hmr/src/index.ts` 中 `browserTrustFence` + `requestRejection` 的调用位于 `connect(res)` **之前**；对应用例「refuses an unfenced or untrusted /plugins/events request and streams the graph to nobody」。
+- 同一围栏也接在 `/plugins`（bundle 路由）上：`packages/client/modules/src/index.ts`。
+
+### 4. 上游 A/B 对照（官方 0.1.7-rc.2）
+
+| 本轮修复点 | 官方 0.1.7-rc.2 |
+|---|---|
+| `grep` / `glob` 搜索根不传策略 | **未修** |
+| `$DSH_HOME/.credentials*` 经模型可读面可读 | **未修** |
+| `/api/file` 没有读根白名单 | **未修** |
+| `/api/session.export` 没有工作区绑定/鉴权 | **未修** |
+| `/plugins`、`/plugins/events` 没有信任围栏 | **未修** |
+| duplicate Host / Host 与权威不一致 | **未修** |
+| `run_code` 宿主对象泄漏 | **架构已换**（`ptc-runtime-node`），旧 PoC 不再适用；本轮的 `detachedHostSurface` 是在新架构之上补的 |
+
+> 结论与 0.1.5 轮次一致：**升级官方版本不等于修好漏洞**。本轮 7 项里官方对 6 项**一条都没修**，第 7 项（`run_code`）只是换了架构。
+
+---
+
+## 六、已知绕过汇总
 
 | 绕过 | 影响 | 状态 |
 |---|---|---|
@@ -206,10 +260,16 @@ if (mode !== undefined && mode !== 'danger-full-access' && spec.argvConfined !==
 | `danger-full-access` 不设栅栏 | 该模式语义即"无限制" | 设计如此 |
 | 进程级沙箱读面（bwrap/landlock/seatbelt） | read-only 会话的 shell 仍可读宿主文件 | **deferred**（需 Linux/macOS 验证） |
 | 52631 env 全量投影 | `!!js process.env.X` 可读任意环境变量 | **未修复**（需按配置来源分层投影） |
+| 凭据经 `shell` / `pwsh` 可读 | 受限 shell 仍是进程级全盘只读面 | **未修复**（2026-09-26 轮次未动） |
+| 读侧「放宽一次」审批入口 | `read` / `glob` / `grep` schema 无 `sandbox_permissions` | **缺失**（提示与能力面不一致） |
+| `/api/file` 读根不可配置 | `Config.roots` 只有直接挂载才能设 | **未修复**（随附组合未暴露到 `cordis.yml`） |
+| `session.export` 多实例区分 | 身份只到「部署」层；后代日志未逐个复检 | **未修复** |
+| 结构化拒绝 code 进响应体 | 已导出，未进 HTTP body | **未实现** |
+| `apps/web` e2e | `DSH_SNAPSHOT=replay pnpm run test:web` | **未跑**（未验证） |
 
 ---
 
-## 六、尚未验证（Unknown / Not Verified）
+## 七、尚未验证（Unknown / Not Verified）
 
 - loader `!!js` vm 隔离的绕过尝试（未做）
 - 真实模型（非 scripted adapter）下的重复输出复现

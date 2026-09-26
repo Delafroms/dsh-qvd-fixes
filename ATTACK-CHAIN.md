@@ -28,6 +28,8 @@
 链 G  run_code 代码运行时隔离缺口            未上报 · 已提供修复
 ```
 
+> **2026-09-26 更新（0.1.7-rc.2 轮次）**：本轮改动落在链 B（搜索根栅栏、凭据不可读）、链 E（duplicate Host、`/api/file`、`/api/session.export`、`/plugins` 与 `/plugins/events` 围栏）与链 G（新架构上的 `run_code` 封堵）。下文的判定与残留已按本轮结果更新；**残留没有被写成已解决**。
+
 ---
 
 ## 链 A — 配置加载表达式注入（52631）
@@ -47,9 +49,11 @@
 | 前置 | 无（只读会话即可） |
 | 步骤 | 进程内：模型经 `tool-fs` / `tool-str-replace-editor` 读工作区外任意路径；进程级：受限 shell 子进程读整个宿主文件系统 |
 | 阻断点 | `fixes-0.1.5-rc.2.patch`：① 读方法执行点策略校验 + `FS_SANDBOX_DENIED`；② `tool-str-replace-editor` 的 `view` 命令补策略；③ 动态插件 fs 门面强制携带会话策略 |
+| 阻断点（2026-09-26 增补，`fixes-0.1.7-rc.2.patch`） | ④ **搜索根栅栏**：`grep` / `glob` 在 **spawn ripgrep 之前**按会话策略校验搜索根（read-only → workspaceRoot；workspace-write → writableRoots），拒绝文本与 `read` 完全一致；⑤ **凭据不可读**：`$DSH_HOME/.credentials*` 在**任何模式（含 `danger-full-access`）**被拒（`FS_PERMISSION_DENIED`），判据由 `isProtectedReadPath` 单点导出、fs-sandbox 与搜索栅栏共用 |
 | 判定 | **部分缓解** |
 | 残留 1 | **硬链接绕过**（红队实测确认）：工作区内指向外部 inode 的硬链接，路径判定无法察觉。前提是攻击者**已有工作区写原语**，故属限制而非独立漏洞。缓解：敏感文件不要与工作区同卷 |
-| 残留 2 | **进程级读面**（deferred）：bwrap `--ro-bind / /`、landlock `readOnly: ['/']`、seatbelt allow-default 仍把整个宿主只读暴露给受限 shell。需 Linux/macOS 环境验证后端后再谈实现 |
+| 残留 2 | **进程级读面**（deferred）：bwrap `--ro-bind / /`、landlock `readOnly: ['/']`、seatbelt allow-default 仍把整个宿主只读暴露给受限 shell。需 Linux/macOS 环境验证后端后再谈实现。**2026-09-26 轮次未动它** —— 凭据在 shell 通道上仍可读 |
+| 残留 3 | **读侧审批入口缺失**（2026-09-26 新记录）：`read` / `glob` / `grep` 的拒绝提示提到 `sandbox_permissions`，但三个工具的工具 schema 里没有该字段 —— 提示与可操作面不一致 |
 
 ## 链 C — 动态插件 vm 逃逸（52644）
 
@@ -84,8 +88,10 @@
 | 步骤 | 伪造 `Host: 127.0.0.1` 绕过"是否来自本机"的判定 → 调用高权限管理 RPC → 注册指向攻击者假模型服务器的临时提供者 → 用确定性工具调用驱动 bash → 拿到与 DSH 进程同级的权限 |
 | 上游处理 | 0.1.2+ 已内建 browser-token 会话鉴权（launch token + 签名 cookie + 401/403 门禁） |
 | 本仓库补充 | **传输围栏**（现并入 `fixes-0.1.5-rc.2.patch`）：信任判断引入 **TCP peer 判据**（Host 声称 loopback 而 peer 不是 → 拒绝）；`BrowserAuth.authorizeIndex` 的 token→cookie 交换补 peer 校验；新增 `trustedProxies`（默认空 = 最严格） |
+| 本仓库补充（2026-09-26，`fixes-0.1.7-rc.2.patch`） | ① **duplicate Host 拒绝**：`>1` 个 Host（读 `rawHeaders`，不被 `node:http` 的折叠骗过）或 Host ≠ 请求自身权威，一律拒绝；结构化 code 共 9 个（`host-missing` / `host-repeated` / `host-unparsable` / `host-untrusted` / `host-authority-mismatch` / `peer-not-loopback` / `cross-site` / `origin-unparsable` / `origin-mismatch`）；② **`/api/file` 根白名单**：只读根 = Workspace 注册表路径 + cwd + `os.tmpdir()`，越界 403 `MEDIA_PATH_OUTSIDE_ROOTS`；③ **`/api/session.export` 鉴权**：复用同一套 `requestRejection` + 工作区绑定，越权与不存在都 403 `SESSION_LOG_EXPORT_OUTSIDE_WORKSPACE`；④ **`/plugins/events` 与 `/plugins` 围栏**：未认证 401、异 Host/rebound 403，且在查找 bundle 之前拒绝（不写任何 SSE 帧） |
 | 判定 | **已阻断**（远程攻击者）；前提是未声明 `trustedProxies` |
-| 未验证 | 反代实景未测（只在单测里模拟 peer 字符串）；`trustedProxies` 一旦非空，该来源即不受此围栏约束 |
+| 残留 | ① 结构化拒绝 code **已导出但未进 HTTP 响应体**；② `/api/file` 的 `Config.roots` **只有直接挂载才能设**，随附组合未暴露到 `cordis.yml`；③ `session.export` 调用方身份**只判到「部署」层**（同一 `DSH_HOME` 多实例共享注册表时区分不了实例），`includeDescendants` 拉入的后代日志**未逐个复检** |
+| 未验证 | 反代实景未测（只在单测里模拟 peer 字符串）；`trustedProxies` 一旦非空，该来源即不受此围栏约束；`apps/web` e2e（`DSH_SNAPSHOT=replay pnpm run test:web`）**未跑** |
 
 ## 链 F — 沙箱内 Agent 自解除沙箱（CVE-2026-82533，9.6）
 
@@ -107,9 +113,12 @@
 | 影响 | `packages/code-runtime/code-runtime-worker-thread` 把模型代码交给 worker 的**全局作用域**执行，且该运行时**不接收会话沙箱策略** |
 | 前置 | **无** —— 不需要网络暴露、令牌、Host 伪造、插件，也不需要模型越狱 |
 | 实测对照 | 同一会话、同一 `workspace-write` 策略下：`read` / `write` 工具与 `pwsh` 子进程对工作区外路径**全部被拒**，而 `run_code` 仍可读写工作区外文件 |
-| 修复 | `code-runtime-isolation.patch`（改用 `node:vm` 上下文、禁用字符串代码生成、不提供 `importModuleDynamically`、定时器 null-prototype 注入） |
-| 验证 | 动态 `import` 被拒；`process` / `fetch` / `require` 不可见；`Function` 构造器与 `eval` 抛 `EvalError`；正常功能不受影响 |
-| 判定 | **已提供修复，未上报** —— 请勿在官方审核前公开分发该补丁 |
+| 修复（0.1.2–0.1.5 架构） | `code-runtime-isolation.patch`（改用 `node:vm` 上下文、禁用字符串代码生成、不提供 `importModuleDynamically`、定时器 null-prototype 注入） |
+| 验证（0.1.2–0.1.5 架构） | 动态 `import` 被拒；`process` / `fetch` / `require` 不可见；`Function` 构造器与 `eval` 抛 `EvalError`；正常功能不受影响 |
+| **架构变更（2026-09-26）** | 0.1.7-rc.2 上游已换成 `ptc-runtime-node` 架构，旧的 worker-thread 补丁**不适用**该版本；本轮改在新架构上补宿主对象泄漏面 |
+| 修复（0.1.7 架构，已并入 `fixes-0.1.7-rc.2.patch`） | `packages/ptc-runtime/ptc-runtime-node/src/bootstrap.ts` 新增 `detachedHostSurface()`：null 原型包装 + `Reflect.construct` 保留 `new` + `WeakSet` 防环；console shim、每个 namespace 绑定、binding error class 全部包装 |
+| 验证（0.1.7 架构） | `console.log.constructor('return process.pid')()` 由**返回宿主 pid** 变为 `console.log.constructor is not a function` |
+| 判定 | 0.1.2–0.1.5：**已提供修复，未上报**（请勿在官方审核前公开分发旧补丁）；0.1.7：**该逃逸面已封堵**，但 `shell` / `pwsh` 的进程级读面仍未动（见链 B 残留 2） |
 
 ---
 
@@ -126,7 +135,14 @@
 | editor `view` 补策略（同上） | | 部分 | | | | | |
 | 插件 fs 门面围栏（同上） | | 部分 | | | | | |
 | 传输围栏（同上） | | | | | **阻断** | ✗ **挡不住** | |
-| `code-runtime-isolation.patch` | | | | | | | **阻断** |
+| 搜索根栅栏（2026-09-26） | | 部分 | | | | | |
+| 凭据不可读（2026-09-26） | | 部分 | | | | 相关 | |
+| duplicate Host 结构化拒绝（2026-09-26） | | | | | **阻断** | ✗ **挡不住** | |
+| `/api/file` 根白名单（2026-09-26） | | | | | **阻断**（读面） | | |
+| `/api/session.export` 鉴权（2026-09-26） | | | | | **阻断**（导出面） | | |
+| `/plugins` / `/plugins/events` 围栏（2026-09-26） | | | | | **阻断**（信息面） | | |
+| `run_code` 宿主对象封堵（2026-09-26，0.1.7） | | | | | | | **阻断**（该逃逸面） |
+| `code-runtime-isolation.patch`（0.1.2–0.1.5 架构） | | | | | | | **阻断**（旧架构；0.1.7 不适用） |
 
 **读法**：链 C / 链 D 的"阻断"仅对**提示注入型**攻击成立；链 F 的 transport fence 一栏是 **✗**，因为该链的 peer 就是 loopback。
 
@@ -139,7 +155,13 @@
 | 硬链接读取工作区外 inode | **未修复**（路径栅栏的固有边界；需先有工作区写权限） |
 | 进程级沙箱读面 | **deferred**（需 Linux/macOS 后端验证） |
 | 52631 env 全量投影 | **未修复**（架构限制，需上游引入配置来源信任模型） |
-| 凭据存储对 agent 可读 | **未修复**（链 F 的实际入口） |
+| 凭据存储经 `read` / 搜索栅栏 / fs-sandbox 可读 | **已修复**（2026-09-26：任何模式都拒，`FS_PERMISSION_DENIED`） |
+| 凭据存储经 `shell` / `pwsh` 可读 | **未修复**（进程级读面，链 F 仍可走的通道） |
+| 读侧「放宽一次」审批入口 | **缺失**（`read` / `glob` / `grep` schema 无 `sandbox_permissions`） |
+| `/api/file` 读根不可配置（随附组合） | **未修复**（`Config.roots` 只有直接挂载才能设） |
+| `session.export` 的多实例实例区分 | **未修复**（身份只到「部署」层；后代日志未逐个复检） |
+| 结构化拒绝 code 进响应体 | **未实现**（已导出，未进 HTTP body） |
+| `apps/web` e2e（`DSH_SNAPSHOT=replay pnpm run test:web`） | **未验证**（未跑） |
 | `trustedProxies` 非空时的来源 | **未验证**（无反代实景测试） |
 | loader `!!js` vm 隔离的绕过尝试 | **未验证** |
 | TOCTOU（栅栏检查与读取之间的路径替换窗口） | **未验证** |
